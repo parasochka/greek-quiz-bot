@@ -156,11 +156,11 @@ def _clear_all():
     return count
 
 async def save_result(answers):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _save_all, answers)
 
 async def clear_history():
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _clear_all)
 
 # ─── Stats helpers ─────────────────────────────────────────────────────────────
@@ -188,22 +188,6 @@ def days_since_last_session(session_dates):
     if not session_dates:
         return 99
     return (datetime.now() - datetime.strptime(session_dates[-1], "%Y-%m-%d")).days
-
-def topic_stats_7d(history):
-    """7-day breakdown from raw history (used only in /stats display)."""
-    cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-    stats = {}
-    for r in history:
-        if r.get("date", "") < cutoff:
-            continue
-        t = r.get("topic", "")
-        if not t:
-            continue
-        stats.setdefault(t, {"correct": 0, "total": 0})
-        stats[t]["total"] += 1
-        if str(r.get("correct", "")) == "True":
-            stats[t]["correct"] += 1
-    return stats
 
 def type_stats_all(history):
     """Per question-type accuracy from full history (used only in /stats display)."""
@@ -257,8 +241,9 @@ def build_prompt(stats, session_dates):
     pre_exam_note = ""
     if days_left <= 30:
         pre_exam_note = (
-            "ПРЕДЭКЗАМЕНАЦИОННЫЙ РЕЖИМ: добавь 6 вопросов в формате "
-            "короткий текст или диалог на греческом (3-5 строк) + вопрос на понимание прочитанного.\n"
+            "ПРЕДЭКЗАМЕНАЦИОННЫЙ РЕЖИМ: из 20 вопросов ровно 6 должны быть в формате "
+            "короткий текст или диалог на греческом (3-5 строк) + вопрос на понимание прочитанного. "
+            "Эти 6 вопросов входят в общий лимит 20, не сверх него.\n"
         )
 
     return f"""Ты генератор вопросов для ежедневного квиза по греческому языку уровней A1-A2.
@@ -428,9 +413,22 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_quiz(message, user_id):
     msg = await message.reply_text("⏳ Готовлю квиз... Это займет около 15 секунд.")
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         stats, session_dates = await loop.run_in_executor(None, _load_compact_data)
-        questions = await loop.run_in_executor(None, generate_questions, stats, session_dates)
+
+        last_exc = None
+        questions = None
+        for attempt in range(3):
+            try:
+                questions = await loop.run_in_executor(None, generate_questions, stats, session_dates)
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)  # 1s, 2s
+        if questions is None:
+            raise last_exc
+
         user_sessions[user_id] = {
             "questions": questions,
             "current": 0,
@@ -581,7 +579,9 @@ async def finish_quiz(message, user_id):
     )[:3]
 
     streak_cur, streak_best = calc_streak(session_dates)
-    new_streak = streak_cur + 1
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    # today is not yet in session_dates (saved after quiz) — add 1 only for first quiz of the day
+    new_streak = streak_cur if (session_dates and session_dates[-1] == today_str) else streak_cur + 1
 
     if pct >= 95:
         emoji, label, stars = "🎉", "Блестяще!", "⭐⭐⭐⭐⭐"
@@ -645,7 +645,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_stats(update.message)
 
 async def show_stats(message):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     try:
         stats, session_dates = await loop.run_in_executor(None, _load_compact_data)
