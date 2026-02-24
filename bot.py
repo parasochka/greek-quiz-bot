@@ -1,5 +1,8 @@
 import os
 import json
+import html
+import random
+import asyncio
 import gspread
 from datetime import datetime, timedelta
 from google.oauth2.service_account import Credentials
@@ -13,6 +16,10 @@ SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_CREDS = json.loads(os.environ["GOOGLE_CREDS_JSON"])
 
 LETTERS = ["А", "Б", "В", "Г"]
+
+def h(text):
+    """Escape text for HTML parse mode."""
+    return html.escape(str(text))
 
 # ─── Google Sheets ────────────────────────────────────────────────────────────
 
@@ -36,14 +43,16 @@ def load_history():
         print(f"Load history error: {e}")
         return []
 
-def save_result(answers):
-    try:
+async def save_result(answers):
+    """Save quiz results to Google Sheets. Runs sync gspread in thread executor."""
+    def _do_save():
         ws = get_sheet()
         today = datetime.now().strftime("%Y-%m-%d")
         rows = [[today, a["topic"], a["type"], str(a["correct"])] for a in answers]
         ws.append_rows(rows)
-    except Exception as e:
-        print(f"Save error: {e}")
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _do_save)
 
 # ─── Stats helpers ─────────────────────────────────────────────────────────────
 
@@ -170,7 +179,7 @@ def build_prompt(history):
 {{
   "question": "текст вопроса на русском языке",
   "options": ["вариант1", "вариант2", "вариант3", "вариант4"],
-  "correctIndex": 0,
+  "correctIndex": 2,
   "explanation": "пояснение почему этот вариант правильный - полными словами без сокращений, 1-2 предложения на русском языке",
   "topic": "название темы",
   "type": "ru_to_gr | gr_to_ru | choose_form | fill_blank"
@@ -181,7 +190,7 @@ def build_prompt(history):
 - Объясни конкретное правило которое применяется в этом вопросе.
 - 1-2 предложения, не больше.
 
-Варианты ответа уже перемешаны - correctIndex указывает на правильный после перемешивания.
+Варианты ответа должны быть перемешаны случайным образом — correctIndex указывает реальную позицию правильного варианта в массиве.
 Неправильные варианты должны быть правдоподобными - похожие формы, близкие слова, частые ошибки."""
 
 def generate_questions(history):
@@ -197,13 +206,29 @@ def generate_questions(history):
     raw = raw.replace("```json", "").replace("```", "").strip()
     start = raw.index("[")
     end = raw.rindex("]")
-    return json.loads(raw[start:end+1])
+    questions = json.loads(raw[start:end+1])
+
+    # Server-side shuffle: guarantees correct answer is NOT always in position 0,
+    # regardless of what Claude returned.
+    for q in questions:
+        correct_text = q["options"][q["correctIndex"]]
+        random.shuffle(q["options"])
+        q["correctIndex"] = q["options"].index(correct_text)
+
+    return questions
 
 # ─── Session storage ───────────────────────────────────────────────────────────
 
 user_sessions = {}
 
 # ─── Handlers ──────────────────────────────────────────────────────────────────
+
+TYPE_LABELS = {
+    "ru_to_gr": "🇷🇺 → 🇬🇷 Перевод",
+    "gr_to_ru": "🇬🇷 → 🇷🇺 Перевод",
+    "choose_form": "📝 Выбор формы",
+    "fill_blank": "✏️ Заполни пропуск",
+}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -212,10 +237,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("ℹ️ О боте", callback_data="menu_about")],
     ]
     text = (
-        "Привет! Я твой тренер по греческому языку.\n\n"
+        "👋 Привет! Я твой тренер по греческому языку.\n\n"
         "Каждый день я генерирую новый квиз из 20 вопросов, "
         "адаптированный под твой уровень и историю ответов.\n\n"
-        "Цель: подготовка к экзамену A2 по современному греческому языку."
+        "🎯 Цель: подготовка к экзамену A2 по современному греческому языку."
     )
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -225,7 +250,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 Моя статистика", callback_data="menu_stats")],
         [InlineKeyboardButton("ℹ️ О боте", callback_data="menu_about")],
     ]
-    await update.message.reply_text("Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("📋 Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_quiz(update.message, update.effective_user.id)
@@ -236,7 +261,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = query.data
 
     if action == "menu_quiz":
-        await query.message.reply_text("Запускаю квиз...")
+        await query.message.reply_text("⏳ Запускаю квиз...")
         await start_quiz(query.message, query.from_user.id)
 
     elif action == "menu_stats":
@@ -244,21 +269,22 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "menu_about":
         text = (
+            "📖 <b>О боте</b>\n\n"
             "Этот бот помогает готовиться к экзамену A2 по современному греческому языку.\n\n"
-            "Как работает:\n"
-            "- Каждый день генерируется новый квиз из 20 вопросов\n"
-            "- Вопросы подбираются на основе твоей истории ответов\n"
-            "- Слабые темы повторяются чаще\n"
-            "- После каждого ответа объясняется правило\n\n"
-            "Команды:\n"
-            "/quiz - начать квиз\n"
-            "/stats - статистика\n"
-            "/menu - главное меню"
+            "<b>Как работает:</b>\n"
+            "• Каждый день генерируется новый квиз из 20 вопросов\n"
+            "• Вопросы подбираются на основе твоей истории ответов\n"
+            "• Слабые темы повторяются чаще\n"
+            "• После каждого ответа объясняется правило\n\n"
+            "<b>Команды:</b>\n"
+            "/quiz — начать квиз\n"
+            "/stats — статистика\n"
+            "/menu — главное меню"
         )
-        await query.message.reply_text(text)
+        await query.message.reply_text(text, parse_mode="HTML")
 
 async def start_quiz(message, user_id):
-    msg = await message.reply_text("Готовлю квиз... Это займет около 15 секунд.")
+    msg = await message.reply_text("⏳ Готовлю квиз... Это займет около 15 секунд.")
     try:
         history = load_history()
         questions = generate_questions(history)
@@ -273,7 +299,7 @@ async def start_quiz(message, user_id):
         await send_question(message, user_id)
     except Exception as e:
         await msg.edit_text(
-            f"Не удалось загрузить квиз: {e}\n\nПопробуй ещё раз через /quiz"
+            f"❌ Не удалось загрузить квиз: {e}\n\nПопробуй ещё раз через /quiz"
         )
 
 async def send_question(message, user_id):
@@ -282,16 +308,19 @@ async def send_question(message, user_id):
     num = session["current"] + 1
     total = len(session["questions"])
 
+    type_label = TYPE_LABELS.get(q.get("type", ""), "❓ Вопрос")
+
     keyboard = [
         [InlineKeyboardButton(f"{LETTERS[i]}. {opt}", callback_data=f"ans_{i}")]
         for i, opt in enumerate(q["options"])
     ]
+
     text = (
-        f"Вопрос {num} из {total}\n"
-        f"Тема: {q['topic']}\n\n"
-        f"{q['question']}"
+        f"<b>Вопрос {num} из {total}</b>  •  {type_label}\n"
+        f"📌 <i>Тема: {h(q['topic'])}</i>\n\n"
+        f"❓ {h(q['question'])}"
     )
-    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -330,22 +359,22 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if correct:
         result = (
-            f"Верно!\n\n"
-            f"Правильный ответ: {correct_letter}. {correct_text}\n\n"
-            f"{q['explanation']}"
+            f"✅ <b>Верно!</b>\n\n"
+            f"<b>{h(correct_letter)}. {h(correct_text)}</b>\n\n"
+            f"💡 {h(q['explanation'])}"
         )
     else:
         selected_letter = LETTERS[selected]
         selected_text = q["options"][selected]
         result = (
-            f"Неверно.\n\n"
-            f"Твой ответ: {selected_letter}. {selected_text}\n"
-            f"Правильный ответ: {correct_letter}. {correct_text}\n\n"
-            f"{q['explanation']}"
+            f"❌ <b>Неверно.</b>\n\n"
+            f"Твой ответ: {h(selected_letter)}. {h(selected_text)}\n"
+            f"✅ Правильный ответ: <b>{h(correct_letter)}. {h(correct_text)}</b>\n\n"
+            f"💡 {h(q['explanation'])}"
         )
 
     await query.edit_message_reply_markup(reply_markup=None)
-    await query.message.reply_text(result)
+    await query.message.reply_text(result, parse_mode="HTML")
 
     session["current"] += 1
     if session["current"] >= len(session["questions"]):
@@ -382,23 +411,41 @@ async def finish_quiz(message, user_id):
     streak_cur, streak_best = calc_streak(history)
     new_streak = streak_cur + 1
 
-    emoji = "🎉" if pct >= 80 else "👍" if pct >= 60 else "💪"
-    label = "Отлично!" if pct >= 80 else "Хороший результат!" if pct >= 60 else "Нужно повторить."
+    if pct >= 80:
+        emoji, label = "🎉", "Отлично!"
+        stars = "⭐⭐⭐⭐⭐" if pct >= 95 else "⭐⭐⭐⭐"
+    elif pct >= 60:
+        emoji, label = "👍", "Хороший результат!"
+        stars = "⭐⭐⭐"
+    else:
+        emoji, label = "💪", "Нужно повторить."
+        stars = "⭐⭐" if pct >= 40 else "⭐"
 
     text = (
-        f"{emoji} {label}\n\n"
-        f"Результат: {correct_count} из {total} ({pct}%)\n"
-        f"Серия дней подряд: {new_streak} (рекорд: {max(streak_best, new_streak)})\n"
+        f"{emoji} <b>{label}</b>  {stars}\n\n"
+        f"📊 Результат: <b>{correct_count} из {total} ({pct}%)</b>\n"
+        f"🔥 Серия дней: {new_streak} (рекорд: {max(streak_best, new_streak)})\n"
     )
     if weak:
-        text += "\nСлабые темы сегодня:\n"
+        text += "\n⚠️ <b>Слабые темы сегодня:</b>\n"
         for t, p in weak:
-            text += f"- {t}: {p}%\n"
-    text += "\nДля нового квиза напиши /quiz"
+            text += f"  • {h(t)}: {p}%\n"
+    text += "\n▶️ Для нового квиза напиши /quiz"
 
-    save_result(answers)
+    # Save results — errors are surfaced to user instead of being silently swallowed
+    try:
+        await save_result(answers)
+    except Exception as e:
+        print(f"Save error: {e}")
+        await message.reply_text(
+            f"⚠️ <b>Не удалось сохранить результаты в Google Sheets:</b>\n<code>{h(str(e))}</code>\n\n{text}",
+            parse_mode="HTML"
+        )
+        del user_sessions[user_id]
+        return
+
     del user_sessions[user_id]
-    await message.reply_text(text)
+    await message.reply_text(text, parse_mode="HTML")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_stats(update.message, update.effective_user.id)
@@ -407,7 +454,7 @@ async def show_stats(message, user_id):
     history = load_history()
     if not history:
         await message.reply_text(
-            "Статистика пока пустая. Пройди первый квиз через /quiz"
+            "📊 Статистика пока пустая. Пройди первый квиз через /quiz"
         )
         return
 
@@ -431,23 +478,23 @@ async def show_stats(message, user_id):
     days_left = max((exam_date - datetime.now()).days, 0)
 
     text = (
-        f"Твоя статистика:\n\n"
-        f"До экзамена: {days_left} дней\n"
-        f"Серия дней подряд: {streak_cur} (рекорд: {streak_best})\n"
-        f"Всего сессий: {total_sessions}\n"
-        f"Всего вопросов: {total_questions}\n"
-        f"Общий результат: {overall_pct}%\n"
+        f"📊 <b>Твоя статистика</b>\n\n"
+        f"📅 До экзамена: <b>{days_left} дней</b>\n"
+        f"🔥 Серия дней: {streak_cur} (рекорд: {streak_best})\n"
+        f"📝 Всего сессий: {total_sessions}\n"
+        f"❓ Всего вопросов: {total_questions}\n"
+        f"✅ Общий результат: <b>{overall_pct}%</b>\n"
     )
     if weak_topics:
-        text += "\nСлабые темы (последние 7 дней):\n"
+        text += "\n⚠️ <b>Слабые темы (последние 7 дней):</b>\n"
         for t, p in weak_topics:
-            text += f"- {t}: {p}%\n"
+            text += f"  • {h(t)}: {p}%\n"
     if strong_topics:
-        text += "\nСильные темы:\n"
+        text += "\n💪 <b>Сильные темы:</b>\n"
         for t, p in strong_topics:
-            text += f"- {t}: {p}%\n"
+            text += f"  • {h(t)}: {p}%\n"
 
-    await message.reply_text(text)
+    await message.reply_text(text, parse_mode="HTML")
 
 # ─── Main ───────────────────────────────────────────────────────────────────────
 
