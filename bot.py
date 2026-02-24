@@ -250,7 +250,7 @@ def build_prompt(stats, session_dates):
             "Только после них переходи к новому.\n"
         )
 
-    exam_date = datetime(2025, 5, 15)
+    exam_date = datetime(2026, 5, 19)
     days_left = max((exam_date - datetime.now()).days, 0)
     pre_exam_note = ""
     if days_left <= 30:
@@ -261,7 +261,7 @@ def build_prompt(stats, session_dates):
 
     return f"""Ты генератор вопросов для ежедневного квиза по греческому языку уровней A1-A2.
 Ученик: Артем, 36 лет, Лимассол. Родной язык: русский. Английский: хорошо.
-Цель: сдать официальный экзамен A2 по современному стандартному греческому языку на Кипре в середине мая 2025.
+Цель: сдать официальный экзамен A2 по современному стандартному греческому языку на Кипре 19 мая 2026.
 До экзамена: {days_left} дней.
 
 КРИТИЧЕСКИ ВАЖНО:
@@ -643,7 +643,7 @@ async def show_stats(message):
     total_correct   = sum(s["correct"] for s in stats.values())
     overall_pct     = round(total_correct / total_questions * 100) if total_questions else 0
 
-    exam_date  = datetime(2025, 5, 15)
+    exam_date  = datetime(2026, 5, 19)
     days_left  = max((exam_date - datetime.now()).days, 0)
 
     text = (
