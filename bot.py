@@ -17,6 +17,8 @@ GOOGLE_CREDS = json.loads(os.environ["GOOGLE_CREDS_JSON"])
 
 LETTERS = ["А", "Б", "В", "Г"]
 
+ALLOWED_USERNAME = "aparasochka"
+
 def h(text):
     return html.escape(str(text))
 
@@ -362,6 +364,9 @@ TYPE_NAMES_RU = {
 }
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.username != ALLOWED_USERNAME:
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
     keyboard = [
         [InlineKeyboardButton("🎯 Начать квиз",    callback_data="menu_quiz")],
         [InlineKeyboardButton("📊 Моя статистика", callback_data="menu_stats")],
@@ -376,6 +381,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.username != ALLOWED_USERNAME:
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
     keyboard = [
         [InlineKeyboardButton("🎯 Начать квиз",    callback_data="menu_quiz")],
         [InlineKeyboardButton("📊 Моя статистика", callback_data="menu_stats")],
@@ -384,6 +392,9 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📋 Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.username != ALLOWED_USERNAME:
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
     await start_quiz(update.message, update.effective_user.id)
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -453,6 +464,9 @@ async def send_question(message, user_id):
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.from_user.username != ALLOWED_USERNAME:
+        await query.answer("⛔ Доступ запрещён.", show_alert=True)
+        return
     user_id = query.from_user.id
     data = query.data
 
@@ -606,6 +620,9 @@ async def finish_quiz(message, user_id):
     await message.reply_text(text, parse_mode="HTML")
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.username != ALLOWED_USERNAME:
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
     keyboard = [[
         InlineKeyboardButton("🗑 Да, удалить всё", callback_data="reset_confirm"),
         InlineKeyboardButton("❌ Отмена",           callback_data="reset_cancel"),
@@ -622,6 +639,9 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.username != ALLOWED_USERNAME:
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
     await show_stats(update.message)
 
 async def show_stats(message):
