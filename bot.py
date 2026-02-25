@@ -146,6 +146,9 @@ def _save_all(answers):
             existing[t] = {"correct": int(r.get("correct", 0)),
                            "total":   int(r.get("total",   0)),
                            "last_seen": r.get("last_seen", "")}
+
+    old_row_count = len(existing) + 1  # header + data rows currently in the sheet
+
     for a in answers:
         t = a["topic"]
         if t not in existing:
@@ -157,8 +160,14 @@ def _save_all(answers):
 
     rows = [["topic", "correct", "total", "last_seen"]]
     rows += [[t, s["correct"], s["total"], s["last_seen"]] for t, s in existing.items()]
-    stats_ws.clear()
+
+    # Write new data FIRST — if this call succeeds, the data is safe.
+    # Only then trim stale trailing rows left from a prior (larger) Stats sheet.
+    # Previously: stats_ws.clear() → stats_ws.update() was not atomic:
+    # a failure after clear() would wipe all accumulated statistics permanently.
     stats_ws.update("A1", rows)
+    if old_row_count > len(rows):
+        stats_ws.delete_rows(len(rows) + 1, old_row_count)
 
     # 3. Sessions — add today if new
     sess_ws = _get_or_create_ws(sh, "Sessions", 1000, 1, ["date"])
