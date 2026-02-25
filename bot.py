@@ -464,7 +464,10 @@ async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     if query.data == "menu_quiz":
         await query.message.reply_text("⏳ Запускаю квиз...")
@@ -555,6 +558,10 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Reset confirmation ──
     if data == "reset_confirm":
+        try:
+            await query.answer()
+        except Exception:
+            pass
         await query.edit_message_reply_markup(reply_markup=None)
         try:
             count = await clear_history()
@@ -570,37 +577,61 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ <b>Ошибка при очистке:</b>\n<code>{h(str(e))}</code>",
                 parse_mode="HTML",
             )
-        await query.answer()
         return
 
     if data == "reset_cancel":
+        try:
+            await query.answer()
+        except Exception:
+            pass
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("✅ Отмена. История не тронута.")
-        await query.answer()
         return
 
     # ── Quiz answer ──
     if not data.startswith("ans_"):
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception:
+            pass
         return
 
     if user_id not in user_sessions:
-        await query.answer("Сессия истекла. Напиши /quiz чтобы начать заново.")
+        try:
+            await query.answer("Сессия истекла. Напиши /quiz чтобы начать заново.")
+        except Exception:
+            pass
         return
 
     session = user_sessions[user_id]
     if not session.get("awaiting"):
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception:
+            pass
         return
 
     try:
         selected = int(data.split("_")[1])
     except (IndexError, ValueError):
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception:
+            pass
         return
     if not (0 <= selected <= 3):
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception:
+            pass
         return
+
+    # Acknowledge the callback query immediately — Telegram requires this within 10 seconds.
+    # All subsequent work (edit, reply, Claude API) can take much longer.
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     session["awaiting"] = False
     q = session["questions"][session["current"]]
@@ -640,8 +671,6 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         session["awaiting"] = True
         await send_question(query.message, user_id)
-
-    await query.answer()
 
 async def finish_quiz(message, user_id):
     session = user_sessions[user_id]
