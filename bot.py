@@ -350,9 +350,12 @@ def generate_questions(stats, session_dates):
     )
     raw = response.content[0].text.strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
-    start = raw.index("[")
-    end = raw.rindex("]")
-    questions = json.loads(raw[start:end+1])
+    try:
+        start = raw.index("[")
+        end = raw.rindex("]")
+        questions = json.loads(raw[start:end+1])
+    except (ValueError, json.JSONDecodeError) as e:
+        raise ValueError(f"Не удалось распарсить ответ Claude: {e}\nСырой ответ: {raw[:300]}")
 
     # Server-side shuffle — correct answer is never stuck at position 0
     for q in questions:
