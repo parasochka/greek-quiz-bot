@@ -82,7 +82,7 @@ def _open_spreadsheet():
 def _get_or_create_ws(sh, name, rows, cols, header):
     try:
         return sh.worksheet(name)
-    except Exception:
+    except gspread.exceptions.WorksheetNotFound:
         ws = sh.add_worksheet(name, rows, cols)
         ws.append_row(header)
         return ws
