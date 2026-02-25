@@ -3,6 +3,7 @@ import json
 import html
 import random
 import asyncio
+import difflib
 import gspread
 from datetime import datetime, timedelta
 from google.oauth2.service_account import Credentials
@@ -44,6 +45,20 @@ MASTER_TOPICS = [
     "Одежда",
     "Наречия",
 ]
+
+
+def normalize_topic(topic: str) -> str:
+    """Map API-returned topic to the nearest canonical MASTER_TOPICS name.
+
+    Claude occasionally mixes in visually similar Greek characters (e.g. ο, ι, Και)
+    inside otherwise-Cyrillic topic names. difflib finds the closest match so
+    statistics are always recorded under the correct canonical key.
+    """
+    if topic in MASTER_TOPICS:
+        return topic
+    matches = difflib.get_close_matches(topic, MASTER_TOPICS, n=1, cutoff=0.6)
+    return matches[0] if matches else topic
+
 
 def h(text):
     return html.escape(str(text))
@@ -261,6 +276,7 @@ STATIC_SYSTEM_PROMPT = """Ты генератор вопросов для еже
 КРИТИЧЕСКИ ВАЖНО — поле "topic":
 Используй ТОЛЬКО эти точные названия тем (скопируй строку целиком, без изменений):
 Глаголы, Прошедшее время, Будущее время, Отрицание, Местоимения, Артикли, Существительные, Прилагательные, Указательные местоимения, Числа, Вопросительные слова, Предлоги и союзы, Бытовые ситуации, Время и дата, Семья, Части тела, Погода, Дом и квартира, Еда и продукты, Одежда, Наречия
+ЗАПРЕЩЕНО: использовать греческие буквы внутри названия темы. Названия тем — строго кириллица, точно как в списке выше.
 
 Полный перечень тем (все темы должны встречаться со временем):
 ГЛАГОЛЫ: είμαι, έχω, θέλω, κάνω, πάω, μπορώ, ξέρω, βλέπω, τρώω, πίνω, μιλάω, λέω, μένω, δουλεύω, αγοράζω, πληρώνω, παίρνω, δίνω, ανοίγω, κλείνω, αρχίζω, τελειώνω
@@ -399,6 +415,10 @@ def generate_questions(stats, session_dates):
         questions = json.loads(raw[start:end+1])
     except (ValueError, json.JSONDecodeError) as e:
         raise ValueError(f"Не удалось распарсить ответ Claude: {e}\nСырой ответ: {raw[:300]}")
+
+    # Normalise topic names — guard against mixed Greek/Cyrillic characters
+    for q in questions:
+        q["topic"] = normalize_topic(q["topic"])
 
     # Server-side shuffle — correct answer is never stuck at position 0
     for q in questions:
