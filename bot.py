@@ -82,7 +82,7 @@ def _open_spreadsheet():
 def _get_or_create_ws(sh, name, rows, cols, header):
     try:
         return sh.worksheet(name)
-    except Exception:
+    except gspread.exceptions.WorksheetNotFound:
         ws = sh.add_worksheet(name, rows, cols)
         ws.append_row(header)
         return ws
@@ -424,6 +424,11 @@ def generate_questions(stats, session_dates):
         questions = json.loads(raw[start:end+1])
     except (ValueError, json.JSONDecodeError) as e:
         raise ValueError(f"Не удалось распарсить ответ Claude: {e}\nСырой ответ: {raw[:300]}")
+
+    # Validate correctIndex before shuffle — catches silent scoring bugs
+    for i, q in enumerate(questions):
+        if not (0 <= q.get("correctIndex", -1) < len(q.get("options", []))):
+            raise ValueError(f"Question {i}: correctIndex={q.get('correctIndex')} out of range")
 
     # Normalise topic names — guard against mixed Greek/Cyrillic characters
     for q in questions:
