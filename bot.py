@@ -411,7 +411,7 @@ def generate_questions(stats, session_dates):
             {
                 "type": "text",
                 "text": STATIC_SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": {"type": "ephemeral", "ttl": "3600"},
             }
         ],
         messages=[{"role": "user", "content": dynamic_prompt}],
