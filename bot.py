@@ -593,8 +593,16 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
+    try:
+        selected = int(data.split("_")[1])
+    except (IndexError, ValueError):
+        await query.answer()
+        return
+    if not (0 <= selected <= 3):
+        await query.answer()
+        return
+
     session["awaiting"] = False
-    selected = int(data.split("_")[1])
     q = session["questions"][session["current"]]
     correct = selected == q["correctIndex"]
 
