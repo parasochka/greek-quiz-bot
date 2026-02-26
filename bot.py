@@ -165,7 +165,7 @@ def _save_all(answers):
     # Only then trim stale trailing rows left from a prior (larger) Stats sheet.
     # Previously: stats_ws.clear() → stats_ws.update() was not atomic:
     # a failure after clear() would wipe all accumulated statistics permanently.
-    stats_ws.update("A1", rows)
+    stats_ws.update(range_name="A1", values=rows)
     if old_row_count > len(rows):
         stats_ws.delete_rows(len(rows) + 1, old_row_count)
 
