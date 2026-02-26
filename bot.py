@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.error import Conflict
 import anthropic
 
 ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
@@ -880,6 +881,15 @@ async def show_stats(message):
 
 # ─── Main ───────────────────────────────────────────────────────────────────────
 
+async def conflict_error_handler(update, context):
+    """Suppress Conflict errors that appear briefly when a new deploy starts
+    while the previous container is still shutting down. python-telegram-bot
+    retries automatically; we just want a clean warning instead of a traceback."""
+    if isinstance(context.error, Conflict):
+        print("[WARN] Conflict: another bot instance still running, will retry automatically.")
+        return
+    raise context.error
+
 async def post_init(app):
     await app.bot.set_my_commands([
         BotCommand("start", "Главное меню"),
@@ -897,7 +907,8 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CallbackQueryHandler(handle_answer))
-    app.run_polling()
+    app.add_error_handler(conflict_error_handler)
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
