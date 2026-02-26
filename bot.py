@@ -254,10 +254,6 @@ def type_stats_all(history):
     return stats
 
 # ─── Claude prompt ─────────────────────────────────────────────────────────────
-#
-# Static content is cached via Anthropic prompt caching (cache_control: ephemeral).
-# Only the dynamic part (per-session stats + conditional notes) is sent uncached.
-# This cuts input token cost by ~80% on every quiz generation after the first call.
 
 STATIC_SYSTEM_PROMPT = """Ты генератор вопросов для ежедневного квиза по греческому языку уровней A1-A2.
 
@@ -340,7 +336,6 @@ STATIC_SYSTEM_PROMPT = """Ты генератор вопросов для еже
 def build_prompt(stats, session_dates):
     """
     Returns only the dynamic part of the prompt — per-session stats + conditional notes.
-    The static part lives in STATIC_SYSTEM_PROMPT and is sent with cache_control.
 
     stats        — {topic: {correct, total, last_seen}}  (from Stats sheet, compact)
     session_dates — sorted list of date strings          (from Sessions sheet, compact)
@@ -408,13 +403,7 @@ def generate_questions(stats, session_dates):
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=4000,
-        system=[
-            {
-                "type": "text",
-                "text": STATIC_SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral", "ttl": "3600"},
-            }
-        ],
+        system=STATIC_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": dynamic_prompt}],
     )
     raw = response.content[0].text.strip()
