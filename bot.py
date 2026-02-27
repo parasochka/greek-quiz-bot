@@ -6,9 +6,9 @@ import asyncio
 import difflib
 import contextlib
 import asyncpg
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 from telegram.error import Conflict
 import anthropic
 
@@ -36,7 +36,55 @@ async def _acquire():
 
 LETTERS = ["А", "Б", "В", "Г"]
 
-ALLOWED_USERNAME = "aparasochka"
+OWNER_USERNAME = "aparasochka"
+TRIBUTE_URL = os.environ.get("TRIBUTE_URL", "https://t.me/tribute")
+
+
+def is_access_allowed(user) -> bool:
+    """Currently only the owner has access. Future: check subscription_status."""
+    return user.username == OWNER_USERNAME
+
+
+# ─── Onboarding ───────────────────────────────────────────────────────────────
+
+STATE_ONBOARDING = "onboarding"
+STATE_SETTINGS_EDIT = "settings_edit"
+
+ONBOARDING_STEPS = [
+    {"key": "display_name", "q": "Как тебя называть?",                              "type": "text"},
+    {"key": "age",          "q": "Сколько тебе лет?",                               "type": "text"},
+    {"key": "city",         "q": "В каком городе живёшь?",                          "type": "text"},
+    {"key": "native_lang",  "q": "Твой родной язык:",                               "type": "choice",
+     "options": ["Русский", "Украинский", "Другой"]},
+    {"key": "other_langs",  "q": "Другие языки кроме родного:",                     "type": "choice",
+     "options": ["Английский (хорошо)", "Английский (базовый)", "Нет других"]},
+    {"key": "occupation",   "q": "Чем занимаешься? (работа, учёба)",                "type": "text"},
+    {"key": "family",       "q": "Семья — дети, партнёр? (или напиши «нет»)",       "type": "text"},
+    {"key": "hobbies",      "q": "Хобби и интересы:",                               "type": "text"},
+    {"key": "greek_goal",   "q": "Зачем учишь греческий?",                          "type": "text"},
+    {"key": "exam_date",    "q": "Есть дата экзамена? (ДД.ММ.ГГГГ или «нет»)",     "type": "text"},
+]
+
+WELCOME_TEXT = (
+    "👋 Привет! Я помогу тебе учить греческий язык.\n\n"
+    "🤖 <b>Как это работает:</b>\n"
+    "• Квизы из 20 вопросов — сколько хочешь в день\n"
+    "• Все вопросы генерирует AI на основе твоего профиля\n"
+    "• Первые 3 дня — знакомство с твоим уровнем\n"
+    "• С 4-го дня — умная адаптация: слабые темы чаще, сильные реже\n"
+    "• После каждого ответа — объяснение правила\n\n"
+    "💶 <b>Стоимость:</b> первые 3 дня бесплатно, затем <b>10 € в месяц</b>.\n"
+    "Подписка через Tribute покрывает AI-токены для генерации вопросов.\n\n"
+    "⚠️ <i>Вопросы созданы искусственным интеллектом — возможны неточности.</i>\n\n"
+    "Чтобы начать, расскажи немного о себе — займёт 2 минуты."
+)
+
+MAIN_MENU_KEYBOARD = [
+    [InlineKeyboardButton("🎯 Начать квиз",    callback_data="menu_quiz")],
+    [InlineKeyboardButton("📊 Моя статистика", callback_data="menu_stats")],
+    [InlineKeyboardButton("⚙️ Настройки",      callback_data="menu_settings")],
+    [InlineKeyboardButton("ℹ️ О боте",          callback_data="menu_about")],
+]
 
 # Canonical topic names — used to detect unseen topics and enforce consistent Stats keys.
 # Claude is instructed to use EXACTLY these strings in the "topic" field of each question.
@@ -101,8 +149,33 @@ async def init_db():
                 telegram_id BIGINT PRIMARY KEY,
                 username    VARCHAR(255),
                 first_name  VARCHAR(255),
-                created_at  TIMESTAMPTZ DEFAULT NOW()
-            );
+                created_at  TIMESTAMPTZ DEFAULT NOW(),
+                onboarding_complete BOOLEAN DEFAULT FALSE,
+                subscription_status VARCHAR(20) DEFAULT 'free',
+                subscription_expires_at TIMESTAMPTZ
+            )
+        """)
+        # Add new columns to existing table (idempotent for existing deployments)
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT FALSE")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status VARCHAR(20) DEFAULT 'free'")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                user_id       BIGINT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
+                display_name  VARCHAR(100),
+                age           INT,
+                city          VARCHAR(100),
+                native_lang   VARCHAR(100),
+                other_langs   VARCHAR(200),
+                occupation    TEXT,
+                family_status TEXT,
+                hobbies       TEXT,
+                greek_goal    TEXT,
+                exam_date     DATE,
+                updated_at    TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS quiz_sessions (
                 id              SERIAL PRIMARY KEY,
                 user_id         BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
@@ -110,7 +183,9 @@ async def init_db():
                 completed_at    TIMESTAMPTZ DEFAULT NOW(),
                 correct_answers INT,
                 total_questions INT DEFAULT 20
-            );
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS answers (
                 id            SERIAL PRIMARY KEY,
                 user_id       BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
@@ -119,7 +194,9 @@ async def init_db():
                 topic         VARCHAR(100) NOT NULL,
                 question_type VARCHAR(20)  NOT NULL,
                 correct       BOOLEAN      NOT NULL
-            );
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS topic_stats (
                 user_id   BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
                 topic     VARCHAR(100) NOT NULL,
@@ -127,7 +204,7 @@ async def init_db():
                 total     INT  DEFAULT 0,
                 last_seen DATE,
                 PRIMARY KEY (user_id, topic)
-            );
+            )
         """)
 
 
@@ -138,6 +215,122 @@ async def register_user(user):
             "VALUES ($1, $2, $3) ON CONFLICT (telegram_id) DO NOTHING",
             user.id, user.username, user.first_name,
         )
+
+
+async def _is_onboarding_complete(user_id: int) -> bool:
+    async with _acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT onboarding_complete FROM users WHERE telegram_id = $1", user_id,
+        )
+    return bool(val)
+
+
+async def _load_profile(user_id: int):
+    """Load user profile as dict, or None if not found."""
+    async with _acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM user_profiles WHERE user_id = $1", user_id,
+        )
+    return dict(row) if row else None
+
+
+async def _save_profile(user_id: int, data: dict):
+    """Save profile from onboarding data dict and mark onboarding complete."""
+    age = None
+    if data.get("age"):
+        try:
+            age = int(data["age"])
+        except ValueError:
+            pass
+
+    exam_date = None
+    if data.get("exam_date"):
+        s = data["exam_date"].strip().lower()
+        if s not in ("нет", "no", "-", ""):
+            for fmt in ("%d.%m.%Y", "%d/%m/%Y"):
+                try:
+                    exam_date = datetime.strptime(s, fmt).date()
+                    break
+                except ValueError:
+                    pass
+
+    async with _acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO user_profiles "
+                "(user_id, display_name, age, city, native_lang, other_langs, "
+                " occupation, family_status, hobbies, greek_goal, exam_date, updated_at) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()) "
+                "ON CONFLICT (user_id) DO UPDATE SET "
+                " display_name=EXCLUDED.display_name, age=EXCLUDED.age, city=EXCLUDED.city, "
+                " native_lang=EXCLUDED.native_lang, other_langs=EXCLUDED.other_langs, "
+                " occupation=EXCLUDED.occupation, family_status=EXCLUDED.family_status, "
+                " hobbies=EXCLUDED.hobbies, greek_goal=EXCLUDED.greek_goal, "
+                " exam_date=EXCLUDED.exam_date, updated_at=NOW()",
+                user_id,
+                data.get("display_name"),
+                age,
+                data.get("city"),
+                data.get("native_lang"),
+                data.get("other_langs"),
+                data.get("occupation"),
+                data.get("family"),
+                data.get("hobbies"),
+                data.get("greek_goal"),
+                exam_date,
+            )
+            await conn.execute(
+                "UPDATE users SET onboarding_complete = TRUE WHERE telegram_id = $1",
+                user_id,
+            )
+
+
+async def _update_profile_field(user_id: int, field: str, value: str):
+    """Update a single profile field."""
+    col_map = {
+        "display_name": "display_name", "age": "age", "city": "city",
+        "native_lang": "native_lang", "other_langs": "other_langs",
+        "occupation": "occupation", "family": "family_status",
+        "hobbies": "hobbies", "greek_goal": "greek_goal", "exam_date": "exam_date",
+    }
+    col = col_map.get(field)
+    if not col:
+        return
+
+    if col == "age":
+        try:
+            val = int(value)
+        except ValueError:
+            val = None
+    elif col == "exam_date":
+        s = value.strip().lower()
+        val = None
+        if s not in ("нет", "no", "-", ""):
+            for fmt in ("%d.%m.%Y", "%d/%m/%Y"):
+                try:
+                    val = datetime.strptime(s, fmt).date()
+                    break
+                except ValueError:
+                    pass
+    else:
+        val = value
+
+    async with _acquire() as conn:
+        await conn.execute(
+            f"UPDATE user_profiles SET {col} = $1, updated_at = NOW() WHERE user_id = $2",
+            val, user_id,
+        )
+
+
+async def _reset_profile(user_id: int):
+    """Delete profile and reset onboarding flag."""
+    async with _acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM user_profiles WHERE user_id = $1", user_id)
+            await conn.execute(
+                "UPDATE users SET onboarding_complete = FALSE WHERE telegram_id = $1",
+                user_id,
+            )
 
 
 async def _load_compact_data(user_id: int):
@@ -281,20 +474,11 @@ def type_stats_all(history):
 
 # ─── Claude prompt ─────────────────────────────────────────────────────────────
 
-STATIC_SYSTEM_PROMPT = """Ты генератор вопросов для ежедневного квиза по греческому языку уровней A1-A2.
-
-Ученик: Артем Парасочка, 36 лет (31.12.1989), живёт в Лимассоле, Кипр — 5 лет. Из России.
-Родной язык: русский. Английский: хорошо.
-Работа: онлайн-маркетинг / IT, каждый день едет в офис на машине.
-Семья: жена Ольга, дети-двойняшки Роберт и Лили (1.5 года).
-Греческий использует: с соседями, в магазинах, кафе. По выходным гуляет на набережной Молос, рынке Агора, в парке и центре Лимассола.
-Цель: сдать официальный экзамен A2 по современному стандартному греческому языку на Кипре 19 мая 2026.
-
-КРИТИЧЕСКИ ВАЖНО:
+PROMPT_STATIC = """КРИТИЧЕСКИ ВАЖНО:
 - Только стандартный современный греческий язык (νέα ελληνική γλώσσα).
 - Никакого кипрского диалекта, кипрских слов, кипрского произношения.
-- Артем не использует греческую клавиатуру. Все вопросы только с вариантами ответа, без ввода текста.
-- КАЖДЫЙ вопрос обязан быть встроен в мини-ситуацию из жизни Артёма. Текст вопроса начинай с короткого сценария (1-2 предложения), потом задавай языковую задачу. Ситуации: еду в офис, разговор с соседом, покупки в Агора, прогулка с детьми у моря, врач/аптека, кафе/ресторан в центре Лимассола, разговор с Ольгой дома.
+- Ученик не использует греческую клавиатуру. Все вопросы только с вариантами ответа, без ввода текста.
+- КАЖДЫЙ вопрос обязан быть встроен в мини-ситуацию из жизни ученика. Используй данные профиля выше (город, работу, хобби, семью, интересы) для создания персональных ситуаций. Текст вопроса начинай с короткого сценария (1-2 предложения), потом задавай языковую задачу.
   Плохо: «Как сказать по-гречески: "31 декабря"?»
   Хорошо: «Ты договариваешься с коллегой о корпоративе. Как сказать: "Вечеринка будет 31 декабря"?»
   Плохо: «Вставь артикль: ___ γυναίκα είναι όμορφη.»
@@ -395,7 +579,53 @@ STATIC_SYSTEM_PROMPT = """Ты генератор вопросов для еже
 Неправильные варианты — правдоподобные: похожие формы, близкие слова, частые ошибки."""
 
 
-def build_prompt(stats, session_dates):
+def build_profile_section(profile: dict) -> str:
+    """Build the personal section of the system prompt from user profile data."""
+    name = profile.get("display_name") or "Ученик"
+    age = profile.get("age")
+    city = profile.get("city") or "?"
+    native_lang = profile.get("native_lang") or "?"
+    other_langs = profile.get("other_langs") or ""
+    occupation = profile.get("occupation") or "?"
+    family = profile.get("family_status") or "нет данных"
+    hobbies = profile.get("hobbies") or "?"
+    greek_goal = profile.get("greek_goal") or "изучение греческого"
+    exam_date = profile.get("exam_date")
+
+    age_str = f", {age} лет" if age else ""
+    other_langs_line = ""
+    if other_langs and other_langs.lower() not in ("нет других", "нет", "no"):
+        other_langs_line = f" Другие языки: {other_langs}."
+
+    goal_line = f"Цель: {greek_goal}."
+    if exam_date:
+        if isinstance(exam_date, date):
+            goal_line += f" Сдать экзамен {exam_date.strftime('%d.%m.%Y')}."
+        else:
+            goal_line += f" Сдать экзамен {exam_date}."
+
+    return (
+        f"Ученик: {name}{age_str}, живёт в {city}.\n"
+        f"Родной язык: {native_lang}.{other_langs_line}\n"
+        f"Работа/занятие: {occupation}.\n"
+        f"Семья: {family}.\n"
+        f"Хобби: {hobbies}.\n"
+        f"{goal_line}"
+    )
+
+
+def build_system_prompt(profile: dict) -> str:
+    """Combine intro + personal profile + static quiz rules into the full system prompt."""
+    profile_section = build_profile_section(profile)
+    return (
+        "Ты генератор вопросов для квиза по греческому языку уровней A1-A2.\n\n"
+        + profile_section
+        + "\n\n"
+        + PROMPT_STATIC
+    )
+
+
+def build_dynamic_prompt(stats, session_dates, profile):
     """
     Returns only the dynamic part of the prompt — per-session stats + conditional notes.
 
@@ -453,18 +683,25 @@ def build_prompt(stats, session_dates):
             "Только после них переходи к новому.\n"
         )
 
-    exam_date = datetime(2026, 5, 19)
-    days_left = max((exam_date - datetime.now()).days, 0)
+    exam_date_obj = profile.get("exam_date") if profile else None
+    exam_line = ""
     pre_exam_note = ""
-    if days_left <= 30:
-        pre_exam_note = (
-            "ПРЕДЭКЗАМЕНАЦИОННЫЙ РЕЖИМ: из 20 вопросов ровно 6 должны быть в формате "
-            "короткий текст или диалог на греческом (3-5 строк) + вопрос на понимание прочитанного. "
-            "Эти 6 вопросов входят в общий лимит 20, не сверх него.\n"
-        )
+    if exam_date_obj:
+        if isinstance(exam_date_obj, date):
+            days_left = max((datetime.combine(exam_date_obj, datetime.min.time()) - datetime.now()).days, 0)
+        else:
+            days_left = 0
+        if days_left > 0:
+            exam_line = f"До экзамена: {days_left} дней.\n"
+            if days_left <= 30:
+                pre_exam_note = (
+                    "ПРЕДЭКЗАМЕНАЦИОННЫЙ РЕЖИМ: из 20 вопросов ровно 6 должны быть в формате "
+                    "короткий текст или диалог на греческом (3-5 строк) + вопрос на понимание прочитанного. "
+                    "Эти 6 вопросов входят в общий лимит 20, не сверх него.\n"
+                )
 
     return (
-        f"До экзамена: {days_left} дней.\n"
+        f"{exam_line}"
         f"{learning_note}"
         f"{review_note}"
         f"{pre_exam_note}"
@@ -473,13 +710,14 @@ def build_prompt(stats, session_dates):
     )
 
 
-def generate_questions(stats, session_dates):
+def generate_questions(stats, session_dates, profile):
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-    dynamic_prompt = build_prompt(stats, session_dates)
+    system_prompt = build_system_prompt(profile or {})
+    dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=4000,
-        system=STATIC_SYSTEM_PROMPT,
+        system=system_prompt,
         messages=[{"role": "user", "content": dynamic_prompt}],
     )
     raw = response.content[0].text.strip()
@@ -528,37 +766,71 @@ TYPE_NAMES_RU = {
     "fill_blank":  "Заполни пропуск",
 }
 
+async def _send_onboarding_step(message, step_index, context):
+    """Send the next onboarding question to the user."""
+    step = ONBOARDING_STEPS[step_index]
+    context.user_data["state"] = STATE_ONBOARDING
+    context.user_data["step"] = step_index
+
+    num = f"({step_index + 1}/{len(ONBOARDING_STEPS)}) "
+    if step["type"] == "choice":
+        keyboard = [
+            [InlineKeyboardButton(opt, callback_data=f"onb_{step['key']}_{i}")]
+            for i, opt in enumerate(step["options"])
+        ]
+        await message.reply_text(
+            f"📝 {num}{step['q']}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    else:
+        await message.reply_text(f"📝 {num}{step['q']}")
+
+
+async def _finish_onboarding(message, user_id, context):
+    """Save collected profile data and show main menu."""
+    data = context.user_data.get("onboarding_data", {})
+    await _save_profile(user_id, data)
+    context.user_data.clear()
+    await message.reply_text(
+        "✅ Отлично! Анкета заполнена.\n"
+        "Теперь квизы будут персональными — вопросы из твоей жизни.\n\n"
+        "Можно начинать!",
+        reply_markup=InlineKeyboardMarkup(MAIN_MENU_KEYBOARD),
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != ALLOWED_USERNAME:
+    if not is_access_allowed(update.effective_user):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
     await register_user(update.effective_user)
-    keyboard = [
-        [InlineKeyboardButton("🎯 Начать квиз",    callback_data="menu_quiz")],
-        [InlineKeyboardButton("📊 Моя статистика", callback_data="menu_stats")],
-        [InlineKeyboardButton("ℹ️ О боте",          callback_data="menu_about")],
-    ]
-    await update.message.reply_text(
-        "👋 Привет! Я твой тренер по греческому языку.\n\n"
-        "Каждый день я генерирую новый квиз из 20 вопросов, "
-        "адаптированный под твой уровень и историю ответов.\n\n"
-        "🎯 Цель: подготовка к экзамену A2 по современному греческому языку.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    context.user_data.clear()
+
+    if await _is_onboarding_complete(update.effective_user.id):
+        await update.message.reply_text(
+            "📋 Главное меню:",
+            reply_markup=InlineKeyboardMarkup(MAIN_MENU_KEYBOARD),
+        )
+    else:
+        keyboard = [[InlineKeyboardButton("📋 Заполнить анкету", callback_data="start_onboarding")]]
+        await update.message.reply_text(
+            WELCOME_TEXT,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
+
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != ALLOWED_USERNAME:
+    if not is_access_allowed(update.effective_user):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
-    keyboard = [
-        [InlineKeyboardButton("🎯 Начать квиз",    callback_data="menu_quiz")],
-        [InlineKeyboardButton("📊 Моя статистика", callback_data="menu_stats")],
-        [InlineKeyboardButton("ℹ️ О боте",          callback_data="menu_about")],
-    ]
-    await update.message.reply_text("📋 Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(
+        "📋 Главное меню:",
+        reply_markup=InlineKeyboardMarkup(MAIN_MENU_KEYBOARD),
+    )
 
 async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != ALLOWED_USERNAME:
+    if not is_access_allowed(update.effective_user):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
     await start_quiz(update.message, update.effective_user.id)
@@ -577,34 +849,42 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "menu_stats":
         await show_stats(query.message, query.from_user.id)
 
+    elif query.data == "menu_settings":
+        await settings_menu(query.message)
+
     elif query.data == "menu_about":
         await query.message.reply_text(
             "📖 <b>О боте</b>\n\n"
-            "Помогает готовиться к экзамену A2 по современному греческому языку.\n\n"
+            "Помогает учить современный греческий язык (A1-A2).\n\n"
             "<b>Как работает:</b>\n"
-            "• Квиз из 20 вопросов каждый день\n"
-            "• Первые 3 дня — режим обучения: бот равномерно охватывает все темы, чтобы собрать базовую статистику\n"
-            "• С 4-го дня — адаптивный режим: слабые темы повторяются чаще, сильные — реже\n"
+            "• Квизы из 20 вопросов — сколько хочешь в день\n"
+            "• Все вопросы генерирует AI на основе твоего профиля\n"
+            "• Первые 3 дня — режим обучения: бот охватывает все темы\n"
+            "• С 4-го дня — адаптивный режим: слабые темы чаще, сильные реже\n"
             "• После каждого ответа — объяснение правила\n\n"
             "<b>Команды:</b>\n"
             "/quiz — начать квиз\n"
             "/stats — статистика\n"
+            "/settings — настройки профиля\n"
             "/reset — сбросить историю\n"
-            "/menu — главное меню",
+            "/menu — главное меню\n\n"
+            "⚠️ Вопросы генерирует AI — возможны неточности.\n\n"
+            "Автор: @aparasochka",
             parse_mode="HTML",
         )
 
 async def start_quiz(message, user_id):
-    msg = await message.reply_text("⏳ Готовлю квиз... Это займет около 15 секунд.")
+    msg = await message.reply_text("⏳ Готовлю квиз... Это займёт около 15 секунд.")
     try:
         stats, session_dates = await _load_compact_data(user_id)
+        profile = await _load_profile(user_id) or {}
 
         loop = asyncio.get_running_loop()
         last_exc = None
         questions = None
         for attempt in range(3):
             try:
-                questions = await loop.run_in_executor(None, generate_questions, stats, session_dates)
+                questions = await loop.run_in_executor(None, generate_questions, stats, session_dates, profile)
                 break
             except Exception as exc:
                 last_exc = exc
@@ -646,7 +926,7 @@ async def send_question(message, user_id):
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.username != ALLOWED_USERNAME:
+    if not is_access_allowed(query.from_user):
         await query.answer("⛔ Доступ запрещён.", show_alert=True)
         return
     user_id = query.from_user.id
@@ -655,6 +935,149 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Menu ──
     if data.startswith("menu_"):
         await handle_menu(update, context)
+        return
+
+    # ── Onboarding start ──
+    if data == "start_onboarding":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        context.user_data["state"] = STATE_ONBOARDING
+        context.user_data["step"] = 0
+        context.user_data["onboarding_data"] = {}
+        await _send_onboarding_step(query.message, 0, context)
+        return
+
+    # ── Onboarding choice answer ──
+    if data.startswith("onb_"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_reply_markup(reply_markup=None)
+        parts = data.split("_")  # onb_<key>_<idx>
+        key = parts[1]
+        opt_idx = int(parts[2])
+        step = next(s for s in ONBOARDING_STEPS if s["key"] == key)
+        value = step["options"][opt_idx]
+        context.user_data.setdefault("onboarding_data", {})[key] = value
+        next_step = context.user_data.get("step", 0) + 1
+        context.user_data["step"] = next_step
+        if next_step >= len(ONBOARDING_STEPS):
+            await _finish_onboarding(query.message, user_id, context)
+        else:
+            await _send_onboarding_step(query.message, next_step, context)
+        return
+
+    # ── Settings ──
+    if data == "settings_view":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        profile = await _load_profile(user_id)
+        if not profile:
+            await query.message.reply_text("Профиль не заполнен. Нажми /start чтобы пройти анкету.")
+        else:
+            await query.message.reply_text(
+                _format_profile(profile),
+                parse_mode="HTML",
+            )
+        return
+
+    if data == "settings_edit_menu":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        keyboard = [
+            [InlineKeyboardButton(label, callback_data=f"setedit_{key}")]
+            for key, label in PROFILE_FIELD_LABELS.items()
+        ]
+        keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="settings_back")])
+        await query.message.reply_text(
+            "✏️ Выбери поле для редактирования:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    if data.startswith("setedit_"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        field = data[len("setedit_"):]
+        step = next((s for s in ONBOARDING_STEPS if s["key"] == field), None)
+        label = PROFILE_FIELD_LABELS.get(field, field)
+        if step and step["type"] == "choice":
+            keyboard = [
+                [InlineKeyboardButton(opt, callback_data=f"setopt_{field}_{i}")]
+                for i, opt in enumerate(step["options"])
+            ]
+            await query.message.reply_text(
+                f"✏️ {label}:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        else:
+            context.user_data["state"] = STATE_SETTINGS_EDIT
+            context.user_data["field"] = field
+            await query.message.reply_text(f"✏️ Введи новое значение для «{label}»:")
+        return
+
+    if data.startswith("setopt_"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_reply_markup(reply_markup=None)
+        parts = data.split("_")  # setopt_<key>_<idx>
+        field = parts[1]
+        opt_idx = int(parts[2])
+        step = next(s for s in ONBOARDING_STEPS if s["key"] == field)
+        value = step["options"][opt_idx]
+        await _update_profile_field(user_id, field, value)
+        label = PROFILE_FIELD_LABELS.get(field, field)
+        await query.message.reply_text(f"✅ Поле «{label}» обновлено: {value}")
+        return
+
+    if data == "settings_reset_ask":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        keyboard = [[
+            InlineKeyboardButton("🗑 Да, сбросить", callback_data="settings_reset_confirm"),
+            InlineKeyboardButton("❌ Отмена",        callback_data="settings_back"),
+        ]]
+        await query.message.reply_text(
+            "⚠️ Профиль будет удалён и анкету придётся пройти заново.\nПродолжить?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    if data == "settings_reset_confirm":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_reply_markup(reply_markup=None)
+        await _reset_profile(user_id)
+        context.user_data.clear()
+        await query.message.reply_text(
+            "✅ Профиль сброшен. Нажми /start чтобы пройти анкету заново."
+        )
+        return
+
+    if data == "settings_back":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.message.reply_text(
+            "📋 Главное меню:",
+            reply_markup=InlineKeyboardMarkup(MAIN_MENU_KEYBOARD),
+        )
         return
 
     # ── Reset confirmation ──
@@ -838,7 +1261,7 @@ async def finish_quiz(message, user_id):
     await message.reply_text(text, parse_mode="HTML")
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != ALLOWED_USERNAME:
+    if not is_access_allowed(update.effective_user):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
     keyboard = [[
@@ -857,7 +1280,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != ALLOWED_USERNAME:
+    if not is_access_allowed(update.effective_user):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
     await show_stats(update.message, update.effective_user.id)
@@ -882,8 +1305,13 @@ async def show_stats(message, user_id: int):
     learning_days = len(session_dates)
     is_learning = learning_days < 3
 
-    exam_date  = datetime(2026, 5, 19)
-    days_left  = max((exam_date - datetime.now()).days, 0)
+    profile = await _load_profile(user_id) or {}
+    exam_date_obj = profile.get("exam_date")
+    exam_line = ""
+    if exam_date_obj and isinstance(exam_date_obj, date):
+        days_left = max((datetime.combine(exam_date_obj, datetime.min.time()) - datetime.now()).days, 0)
+        if days_left > 0:
+            exam_line = f"📅 До экзамена: <b>{days_left} дней</b>\n"
 
     learning_status = (
         f"🎓 <b>Идёт обучение</b> ({learning_days} из 3 дней) — бот собирает статистику\n"
@@ -893,7 +1321,7 @@ async def show_stats(message, user_id: int):
     text = (
         f"📊 <b>Твоя статистика</b>\n\n"
         f"{learning_status}"
-        f"📅 До экзамена: <b>{days_left} дней</b>\n"
+        f"{exam_line}"
         f"🔥 Серия дней: {streak_cur} (рекорд: {streak_best})\n"
         f"📝 Всего сессий: {total_sessions}\n"
         f"❓ Всего вопросов: {total_questions}\n"
@@ -952,6 +1380,93 @@ async def show_stats(message, user_id: int):
 
     await message.reply_text(text, parse_mode="HTML")
 
+# ─── Text message handler (onboarding + settings edit) ────────────────────────
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle free-text input during onboarding or settings edit."""
+    user = update.effective_user
+    if not is_access_allowed(user):
+        return
+
+    state = context.user_data.get("state")
+    user_id = user.id
+    text = update.message.text.strip()
+
+    if state == STATE_ONBOARDING:
+        step_index = context.user_data.get("step", 0)
+        if step_index >= len(ONBOARDING_STEPS):
+            return
+        step = ONBOARDING_STEPS[step_index]
+        if step["type"] != "text":
+            return  # waiting for inline button, not text
+        context.user_data.setdefault("onboarding_data", {})[step["key"]] = text
+        next_step = step_index + 1
+        context.user_data["step"] = next_step
+        if next_step >= len(ONBOARDING_STEPS):
+            await _finish_onboarding(update.message, user_id, context)
+        else:
+            await _send_onboarding_step(update.message, next_step, context)
+        return
+
+    if state == STATE_SETTINGS_EDIT:
+        field = context.user_data.get("field")
+        if not field:
+            return
+        await _update_profile_field(user_id, field, text)
+        label = PROFILE_FIELD_LABELS.get(field, field)
+        context.user_data.pop("state", None)
+        context.user_data.pop("field", None)
+        await update.message.reply_text(f"✅ Поле «{label}» обновлено.")
+        return
+
+
+# ─── Settings ─────────────────────────────────────────────────────────────────
+
+PROFILE_FIELD_LABELS = {
+    "display_name": "Имя",       "age":        "Возраст",
+    "city":         "Город",     "native_lang": "Родной язык",
+    "other_langs":  "Другие языки", "occupation": "Работа/занятие",
+    "family":       "Семья",     "hobbies":     "Хобби",
+    "greek_goal":   "Цель изучения", "exam_date": "Дата экзамена",
+}
+
+
+def _format_profile(profile: dict) -> str:
+    """Format profile data for display."""
+    def _v(key, default="—"):
+        val = profile.get(key)
+        if val is None:
+            return default
+        if isinstance(val, date):
+            return val.strftime("%d.%m.%Y")
+        return str(val)
+
+    return (
+        "👤 <b>Твой профиль</b>\n\n"
+        f"Имя: {h(_v('display_name'))}\n"
+        f"Возраст: {h(_v('age'))}\n"
+        f"Город: {h(_v('city'))}\n"
+        f"Родной язык: {h(_v('native_lang'))}\n"
+        f"Другие языки: {h(_v('other_langs'))}\n"
+        f"Работа/занятие: {h(_v('occupation'))}\n"
+        f"Семья: {h(_v('family_status'))}\n"
+        f"Хобби: {h(_v('hobbies'))}\n"
+        f"Цель изучения: {h(_v('greek_goal'))}\n"
+        f"Дата экзамена: {h(_v('exam_date'))}"
+    )
+
+
+async def settings_menu(message):
+    """Show the settings menu (called from /settings command or menu button)."""
+    keyboard = [
+        [InlineKeyboardButton("👤 Мой профиль",      callback_data="settings_view")],
+        [InlineKeyboardButton("✏️ Изменить данные",   callback_data="settings_edit_menu")],
+        [InlineKeyboardButton("🗑 Сбросить профиль",  callback_data="settings_reset_ask")],
+        [InlineKeyboardButton("◀️ Назад",             callback_data="settings_back")],
+    ]
+    await message.reply_text("⚙️ Настройки", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
 # ─── Main ───────────────────────────────────────────────────────────────────────
 
 async def conflict_error_handler(update, context):
@@ -963,24 +1478,34 @@ async def conflict_error_handler(update, context):
         return
     raise context.error
 
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_access_allowed(update.effective_user):
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+    await settings_menu(update.message)
+
+
 async def post_init(app):
     await init_db()
     await app.bot.set_my_commands([
-        BotCommand("start", "Главное меню"),
-        BotCommand("quiz",  "Начать квиз"),
-        BotCommand("stats", "Моя статистика"),
-        BotCommand("reset", "Сбросить историю"),
-        BotCommand("menu",  "Главное меню"),
+        BotCommand("start",    "Главное меню"),
+        BotCommand("quiz",     "Начать квиз"),
+        BotCommand("stats",    "Моя статистика"),
+        BotCommand("settings", "Настройки профиля"),
+        BotCommand("reset",    "Сбросить историю"),
+        BotCommand("menu",     "Главное меню"),
     ])
 
 def main():
     app = Application.builder().token(TG_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu",  menu))
-    app.add_handler(CommandHandler("quiz",  quiz_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("reset", reset_command))
+    app.add_handler(CommandHandler("start",    start))
+    app.add_handler(CommandHandler("menu",     menu))
+    app.add_handler(CommandHandler("quiz",     quiz_command))
+    app.add_handler(CommandHandler("stats",    stats_command))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("reset",    reset_command))
     app.add_handler(CallbackQueryHandler(handle_answer))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_error_handler(conflict_error_handler)
     app.run_polling(drop_pending_updates=True)
 
