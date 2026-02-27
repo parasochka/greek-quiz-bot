@@ -8,7 +8,7 @@ import contextlib
 import asyncpg
 from datetime import datetime, date, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 from telegram.error import Conflict
 import anthropic
 
@@ -43,6 +43,48 @@ TRIBUTE_URL = os.environ.get("TRIBUTE_URL", "https://t.me/tribute")
 def is_access_allowed(user) -> bool:
     """Currently only the owner has access. Future: check subscription_status."""
     return user.username == OWNER_USERNAME
+
+
+# ─── Onboarding ───────────────────────────────────────────────────────────────
+
+STATE_ONBOARDING = "onboarding"
+STATE_SETTINGS_EDIT = "settings_edit"
+
+ONBOARDING_STEPS = [
+    {"key": "display_name", "q": "Как тебя называть?",                              "type": "text"},
+    {"key": "age",          "q": "Сколько тебе лет?",                               "type": "text"},
+    {"key": "city",         "q": "В каком городе живёшь?",                          "type": "text"},
+    {"key": "native_lang",  "q": "Твой родной язык:",                               "type": "choice",
+     "options": ["Русский", "Украинский", "Другой"]},
+    {"key": "other_langs",  "q": "Другие языки кроме родного:",                     "type": "choice",
+     "options": ["Английский (хорошо)", "Английский (базовый)", "Нет других"]},
+    {"key": "occupation",   "q": "Чем занимаешься? (работа, учёба)",                "type": "text"},
+    {"key": "family",       "q": "Семья — дети, партнёр? (или напиши «нет»)",       "type": "text"},
+    {"key": "hobbies",      "q": "Хобби и интересы:",                               "type": "text"},
+    {"key": "greek_goal",   "q": "Зачем учишь греческий?",                          "type": "text"},
+    {"key": "exam_date",    "q": "Есть дата экзамена? (ДД.ММ.ГГГГ или «нет»)",     "type": "text"},
+]
+
+WELCOME_TEXT = (
+    "👋 Привет! Я помогу тебе учить греческий язык.\n\n"
+    "🤖 <b>Как это работает:</b>\n"
+    "• Квизы из 20 вопросов — сколько хочешь в день\n"
+    "• Все вопросы генерирует AI на основе твоего профиля\n"
+    "• Первые 3 дня — знакомство с твоим уровнем\n"
+    "• С 4-го дня — умная адаптация: слабые темы чаще, сильные реже\n"
+    "• После каждого ответа — объяснение правила\n\n"
+    "💶 <b>Стоимость:</b> первые 3 дня бесплатно, затем <b>10 € в месяц</b>.\n"
+    "Подписка через Tribute покрывает AI-токены для генерации вопросов.\n\n"
+    "⚠️ <i>Вопросы созданы искусственным интеллектом — возможны неточности.</i>\n\n"
+    "Чтобы начать, расскажи немного о себе — займёт 2 минуты."
+)
+
+MAIN_MENU_KEYBOARD = [
+    [InlineKeyboardButton("🎯 Начать квиз",    callback_data="menu_quiz")],
+    [InlineKeyboardButton("📊 Моя статистика", callback_data="menu_stats")],
+    [InlineKeyboardButton("⚙️ Настройки",      callback_data="menu_settings")],
+    [InlineKeyboardButton("ℹ️ О боте",          callback_data="menu_about")],
+]
 
 # Canonical topic names — used to detect unseen topics and enforce consistent Stats keys.
 # Claude is instructed to use EXACTLY these strings in the "topic" field of each question.
@@ -724,33 +766,68 @@ TYPE_NAMES_RU = {
     "fill_blank":  "Заполни пропуск",
 }
 
+async def _send_onboarding_step(message, step_index, context):
+    """Send the next onboarding question to the user."""
+    step = ONBOARDING_STEPS[step_index]
+    context.user_data["state"] = STATE_ONBOARDING
+    context.user_data["step"] = step_index
+
+    num = f"({step_index + 1}/{len(ONBOARDING_STEPS)}) "
+    if step["type"] == "choice":
+        keyboard = [
+            [InlineKeyboardButton(opt, callback_data=f"onb_{step['key']}_{i}")]
+            for i, opt in enumerate(step["options"])
+        ]
+        await message.reply_text(
+            f"📝 {num}{step['q']}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    else:
+        await message.reply_text(f"📝 {num}{step['q']}")
+
+
+async def _finish_onboarding(message, user_id, context):
+    """Save collected profile data and show main menu."""
+    data = context.user_data.get("onboarding_data", {})
+    await _save_profile(user_id, data)
+    context.user_data.clear()
+    await message.reply_text(
+        "✅ Отлично! Анкета заполнена.\n"
+        "Теперь квизы будут персональными — вопросы из твоей жизни.\n\n"
+        "Можно начинать!",
+        reply_markup=InlineKeyboardMarkup(MAIN_MENU_KEYBOARD),
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_access_allowed(update.effective_user):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
     await register_user(update.effective_user)
-    keyboard = [
-        [InlineKeyboardButton("🎯 Начать квиз",    callback_data="menu_quiz")],
-        [InlineKeyboardButton("📊 Моя статистика", callback_data="menu_stats")],
-        [InlineKeyboardButton("ℹ️ О боте",          callback_data="menu_about")],
-    ]
-    await update.message.reply_text(
-        "👋 Привет! Я помогу тебе учить греческий язык.\n\n"
-        "Квизы из 20 вопросов — сколько хочешь в день.\n"
-        "Вопросы адаптируются под твой уровень и историю ответов.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    context.user_data.clear()
+
+    if await _is_onboarding_complete(update.effective_user.id):
+        await update.message.reply_text(
+            "📋 Главное меню:",
+            reply_markup=InlineKeyboardMarkup(MAIN_MENU_KEYBOARD),
+        )
+    else:
+        keyboard = [[InlineKeyboardButton("📋 Заполнить анкету", callback_data="start_onboarding")]]
+        await update.message.reply_text(
+            WELCOME_TEXT,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
+
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_access_allowed(update.effective_user):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
-    keyboard = [
-        [InlineKeyboardButton("🎯 Начать квиз",    callback_data="menu_quiz")],
-        [InlineKeyboardButton("📊 Моя статистика", callback_data="menu_stats")],
-        [InlineKeyboardButton("ℹ️ О боте",          callback_data="menu_about")],
-    ]
-    await update.message.reply_text("📋 Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(
+        "📋 Главное меню:",
+        reply_markup=InlineKeyboardMarkup(MAIN_MENU_KEYBOARD),
+    )
 
 async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_access_allowed(update.effective_user):
@@ -771,6 +848,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "menu_stats":
         await show_stats(query.message, query.from_user.id)
+
+    elif query.data == "menu_settings":
+        await settings_menu(query.message)
 
     elif query.data == "menu_about":
         await query.message.reply_text(
@@ -855,6 +935,39 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Menu ──
     if data.startswith("menu_"):
         await handle_menu(update, context)
+        return
+
+    # ── Onboarding start ──
+    if data == "start_onboarding":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        context.user_data["state"] = STATE_ONBOARDING
+        context.user_data["step"] = 0
+        context.user_data["onboarding_data"] = {}
+        await _send_onboarding_step(query.message, 0, context)
+        return
+
+    # ── Onboarding choice answer ──
+    if data.startswith("onb_"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_reply_markup(reply_markup=None)
+        parts = data.split("_")  # onb_<key>_<idx>
+        key = parts[1]
+        opt_idx = int(parts[2])
+        step = next(s for s in ONBOARDING_STEPS if s["key"] == key)
+        value = step["options"][opt_idx]
+        context.user_data.setdefault("onboarding_data", {})[key] = value
+        next_step = context.user_data.get("step", 0) + 1
+        context.user_data["step"] = next_step
+        if next_step >= len(ONBOARDING_STEPS):
+            await _finish_onboarding(query.message, user_id, context)
+        else:
+            await _send_onboarding_step(query.message, next_step, context)
         return
 
     # ── Reset confirmation ──
@@ -1157,6 +1270,68 @@ async def show_stats(message, user_id: int):
 
     await message.reply_text(text, parse_mode="HTML")
 
+# ─── Text message handler (onboarding + settings edit) ────────────────────────
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle free-text input during onboarding or settings edit."""
+    user = update.effective_user
+    if not is_access_allowed(user):
+        return
+
+    state = context.user_data.get("state")
+    user_id = user.id
+    text = update.message.text.strip()
+
+    if state == STATE_ONBOARDING:
+        step_index = context.user_data.get("step", 0)
+        if step_index >= len(ONBOARDING_STEPS):
+            return
+        step = ONBOARDING_STEPS[step_index]
+        if step["type"] != "text":
+            return  # waiting for inline button, not text
+        context.user_data.setdefault("onboarding_data", {})[step["key"]] = text
+        next_step = step_index + 1
+        context.user_data["step"] = next_step
+        if next_step >= len(ONBOARDING_STEPS):
+            await _finish_onboarding(update.message, user_id, context)
+        else:
+            await _send_onboarding_step(update.message, next_step, context)
+        return
+
+    if state == STATE_SETTINGS_EDIT:
+        field = context.user_data.get("field")
+        if not field:
+            return
+        await _update_profile_field(user_id, field, text)
+        label = PROFILE_FIELD_LABELS.get(field, field)
+        context.user_data.pop("state", None)
+        context.user_data.pop("field", None)
+        await update.message.reply_text(f"✅ Поле «{label}» обновлено.")
+        return
+
+
+# ─── Settings ─────────────────────────────────────────────────────────────────
+
+PROFILE_FIELD_LABELS = {
+    "display_name": "Имя",       "age":        "Возраст",
+    "city":         "Город",     "native_lang": "Родной язык",
+    "other_langs":  "Другие языки", "occupation": "Работа/занятие",
+    "family":       "Семья",     "hobbies":     "Хобби",
+    "greek_goal":   "Цель изучения", "exam_date": "Дата экзамена",
+}
+
+
+async def settings_menu(message):
+    """Show the settings menu (called from /settings command or menu button)."""
+    keyboard = [
+        [InlineKeyboardButton("👤 Мой профиль",      callback_data="settings_view")],
+        [InlineKeyboardButton("✏️ Изменить данные",   callback_data="settings_edit_menu")],
+        [InlineKeyboardButton("🗑 Сбросить профиль",  callback_data="settings_reset_ask")],
+        [InlineKeyboardButton("◀️ Назад",             callback_data="settings_back")],
+    ]
+    await message.reply_text("⚙️ Настройки", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
 # ─── Main ───────────────────────────────────────────────────────────────────────
 
 async def conflict_error_handler(update, context):
@@ -1168,24 +1343,34 @@ async def conflict_error_handler(update, context):
         return
     raise context.error
 
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_access_allowed(update.effective_user):
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+    await settings_menu(update.message)
+
+
 async def post_init(app):
     await init_db()
     await app.bot.set_my_commands([
-        BotCommand("start", "Главное меню"),
-        BotCommand("quiz",  "Начать квиз"),
-        BotCommand("stats", "Моя статистика"),
-        BotCommand("reset", "Сбросить историю"),
-        BotCommand("menu",  "Главное меню"),
+        BotCommand("start",    "Главное меню"),
+        BotCommand("quiz",     "Начать квиз"),
+        BotCommand("stats",    "Моя статистика"),
+        BotCommand("settings", "Настройки профиля"),
+        BotCommand("reset",    "Сбросить историю"),
+        BotCommand("menu",     "Главное меню"),
     ])
 
 def main():
     app = Application.builder().token(TG_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu",  menu))
-    app.add_handler(CommandHandler("quiz",  quiz_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("reset", reset_command))
+    app.add_handler(CommandHandler("start",    start))
+    app.add_handler(CommandHandler("menu",     menu))
+    app.add_handler(CommandHandler("quiz",     quiz_command))
+    app.add_handler(CommandHandler("stats",    stats_command))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("reset",    reset_command))
     app.add_handler(CallbackQueryHandler(handle_answer))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_error_handler(conflict_error_handler)
     app.run_polling(drop_pending_updates=True)
 
