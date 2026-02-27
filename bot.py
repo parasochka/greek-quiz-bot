@@ -6,7 +6,7 @@ import asyncio
 import difflib
 import contextlib
 import asyncpg
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.error import Conflict
@@ -36,7 +36,13 @@ async def _acquire():
 
 LETTERS = ["А", "Б", "В", "Г"]
 
-ALLOWED_USERNAME = "aparasochka"
+OWNER_USERNAME = "aparasochka"
+TRIBUTE_URL = os.environ.get("TRIBUTE_URL", "https://t.me/tribute")
+
+
+def is_access_allowed(user) -> bool:
+    """Currently only the owner has access. Future: check subscription_status."""
+    return user.username == OWNER_USERNAME
 
 # Canonical topic names — used to detect unseen topics and enforce consistent Stats keys.
 # Claude is instructed to use EXACTLY these strings in the "topic" field of each question.
@@ -101,8 +107,33 @@ async def init_db():
                 telegram_id BIGINT PRIMARY KEY,
                 username    VARCHAR(255),
                 first_name  VARCHAR(255),
-                created_at  TIMESTAMPTZ DEFAULT NOW()
-            );
+                created_at  TIMESTAMPTZ DEFAULT NOW(),
+                onboarding_complete BOOLEAN DEFAULT FALSE,
+                subscription_status VARCHAR(20) DEFAULT 'free',
+                subscription_expires_at TIMESTAMPTZ
+            )
+        """)
+        # Add new columns to existing table (idempotent for existing deployments)
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT FALSE")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status VARCHAR(20) DEFAULT 'free'")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                user_id       BIGINT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
+                display_name  VARCHAR(100),
+                age           INT,
+                city          VARCHAR(100),
+                native_lang   VARCHAR(100),
+                other_langs   VARCHAR(200),
+                occupation    TEXT,
+                family_status TEXT,
+                hobbies       TEXT,
+                greek_goal    TEXT,
+                exam_date     DATE,
+                updated_at    TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS quiz_sessions (
                 id              SERIAL PRIMARY KEY,
                 user_id         BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
@@ -110,7 +141,9 @@ async def init_db():
                 completed_at    TIMESTAMPTZ DEFAULT NOW(),
                 correct_answers INT,
                 total_questions INT DEFAULT 20
-            );
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS answers (
                 id            SERIAL PRIMARY KEY,
                 user_id       BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
@@ -119,7 +152,9 @@ async def init_db():
                 topic         VARCHAR(100) NOT NULL,
                 question_type VARCHAR(20)  NOT NULL,
                 correct       BOOLEAN      NOT NULL
-            );
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS topic_stats (
                 user_id   BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
                 topic     VARCHAR(100) NOT NULL,
@@ -127,7 +162,7 @@ async def init_db():
                 total     INT  DEFAULT 0,
                 last_seen DATE,
                 PRIMARY KEY (user_id, topic)
-            );
+            )
         """)
 
 
@@ -138,6 +173,122 @@ async def register_user(user):
             "VALUES ($1, $2, $3) ON CONFLICT (telegram_id) DO NOTHING",
             user.id, user.username, user.first_name,
         )
+
+
+async def _is_onboarding_complete(user_id: int) -> bool:
+    async with _acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT onboarding_complete FROM users WHERE telegram_id = $1", user_id,
+        )
+    return bool(val)
+
+
+async def _load_profile(user_id: int):
+    """Load user profile as dict, or None if not found."""
+    async with _acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM user_profiles WHERE user_id = $1", user_id,
+        )
+    return dict(row) if row else None
+
+
+async def _save_profile(user_id: int, data: dict):
+    """Save profile from onboarding data dict and mark onboarding complete."""
+    age = None
+    if data.get("age"):
+        try:
+            age = int(data["age"])
+        except ValueError:
+            pass
+
+    exam_date = None
+    if data.get("exam_date"):
+        s = data["exam_date"].strip().lower()
+        if s not in ("нет", "no", "-", ""):
+            for fmt in ("%d.%m.%Y", "%d/%m/%Y"):
+                try:
+                    exam_date = datetime.strptime(s, fmt).date()
+                    break
+                except ValueError:
+                    pass
+
+    async with _acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO user_profiles "
+                "(user_id, display_name, age, city, native_lang, other_langs, "
+                " occupation, family_status, hobbies, greek_goal, exam_date, updated_at) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()) "
+                "ON CONFLICT (user_id) DO UPDATE SET "
+                " display_name=EXCLUDED.display_name, age=EXCLUDED.age, city=EXCLUDED.city, "
+                " native_lang=EXCLUDED.native_lang, other_langs=EXCLUDED.other_langs, "
+                " occupation=EXCLUDED.occupation, family_status=EXCLUDED.family_status, "
+                " hobbies=EXCLUDED.hobbies, greek_goal=EXCLUDED.greek_goal, "
+                " exam_date=EXCLUDED.exam_date, updated_at=NOW()",
+                user_id,
+                data.get("display_name"),
+                age,
+                data.get("city"),
+                data.get("native_lang"),
+                data.get("other_langs"),
+                data.get("occupation"),
+                data.get("family"),
+                data.get("hobbies"),
+                data.get("greek_goal"),
+                exam_date,
+            )
+            await conn.execute(
+                "UPDATE users SET onboarding_complete = TRUE WHERE telegram_id = $1",
+                user_id,
+            )
+
+
+async def _update_profile_field(user_id: int, field: str, value: str):
+    """Update a single profile field."""
+    col_map = {
+        "display_name": "display_name", "age": "age", "city": "city",
+        "native_lang": "native_lang", "other_langs": "other_langs",
+        "occupation": "occupation", "family": "family_status",
+        "hobbies": "hobbies", "greek_goal": "greek_goal", "exam_date": "exam_date",
+    }
+    col = col_map.get(field)
+    if not col:
+        return
+
+    if col == "age":
+        try:
+            val = int(value)
+        except ValueError:
+            val = None
+    elif col == "exam_date":
+        s = value.strip().lower()
+        val = None
+        if s not in ("нет", "no", "-", ""):
+            for fmt in ("%d.%m.%Y", "%d/%m/%Y"):
+                try:
+                    val = datetime.strptime(s, fmt).date()
+                    break
+                except ValueError:
+                    pass
+    else:
+        val = value
+
+    async with _acquire() as conn:
+        await conn.execute(
+            f"UPDATE user_profiles SET {col} = $1, updated_at = NOW() WHERE user_id = $2",
+            val, user_id,
+        )
+
+
+async def _reset_profile(user_id: int):
+    """Delete profile and reset onboarding flag."""
+    async with _acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM user_profiles WHERE user_id = $1", user_id)
+            await conn.execute(
+                "UPDATE users SET onboarding_complete = FALSE WHERE telegram_id = $1",
+                user_id,
+            )
 
 
 async def _load_compact_data(user_id: int):
@@ -529,7 +680,7 @@ TYPE_NAMES_RU = {
 }
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != ALLOWED_USERNAME:
+    if not is_access_allowed(update.effective_user):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
     await register_user(update.effective_user)
@@ -547,7 +698,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != ALLOWED_USERNAME:
+    if not is_access_allowed(update.effective_user):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
     keyboard = [
@@ -558,7 +709,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📋 Главное меню:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != ALLOWED_USERNAME:
+    if not is_access_allowed(update.effective_user):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
     await start_quiz(update.message, update.effective_user.id)
@@ -646,7 +797,7 @@ async def send_question(message, user_id):
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.username != ALLOWED_USERNAME:
+    if not is_access_allowed(query.from_user):
         await query.answer("⛔ Доступ запрещён.", show_alert=True)
         return
     user_id = query.from_user.id
@@ -838,7 +989,7 @@ async def finish_quiz(message, user_id):
     await message.reply_text(text, parse_mode="HTML")
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != ALLOWED_USERNAME:
+    if not is_access_allowed(update.effective_user):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
     keyboard = [[
@@ -857,7 +1008,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.username != ALLOWED_USERNAME:
+    if not is_access_allowed(update.effective_user):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
     await show_stats(update.message, update.effective_user.id)
