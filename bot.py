@@ -54,30 +54,30 @@ STATE_SETTINGS_EDIT = "settings_edit"
 ONBOARDING_STEPS = [
     {"key": "display_name", "q": "Как тебя называть?",                              "type": "text"},
     {"key": "age",          "q": "Сколько тебе лет?",                               "type": "text"},
-    {"key": "city",         "q": "В каком городе живёшь?",                          "type": "text"},
+    {"key": "city",         "q": "В каком городе проживаешь?",                      "type": "text"},
     {"key": "native_lang",  "q": "Твой родной язык:",                               "type": "choice",
      "options": ["Русский", "Украинский", "Другой"]},
     {"key": "other_langs",  "q": "Другие языки кроме родного:",                     "type": "choice",
      "options": ["Английский (хорошо)", "Английский (базовый)", "Нет других"]},
     {"key": "occupation",   "q": "Чем занимаешься? (работа, учёба)",                "type": "text"},
-    {"key": "family",       "q": "Семья — дети, партнёр? (или напиши «нет»)",       "type": "text"},
+    {"key": "family",       "q": "Семья - дети, партнёр? (или напиши «нет»)",       "type": "text"},
     {"key": "hobbies",      "q": "Хобби и интересы:",                               "type": "text"},
-    {"key": "greek_goal",   "q": "Зачем учишь греческий?",                          "type": "text"},
+    {"key": "greek_goal",   "q": "Где планируешь применять греческий? (например: кафе, соседи, работа)", "type": "text"},
     {"key": "exam_date",    "q": "Есть дата экзамена? (ДД.ММ.ГГГГ или «нет»)",     "type": "text"},
 ]
 
 WELCOME_TEXT = (
-    "👋 Привет! Я помогу тебе учить греческий язык.\n\n"
+    "👋 Привет! Я помогу тебе учить греческий язык (уровень A2).\n\n"
     "🤖 <b>Как это работает:</b>\n"
-    "• Квизы из 20 вопросов — сколько хочешь в день\n"
+    "• Квизы из 20 вопросов - сколько хочешь в день\n"
     "• Все вопросы генерирует AI на основе твоего профиля\n"
-    "• Первые 3 дня — знакомство с твоим уровнем\n"
-    "• С 4-го дня — умная адаптация: слабые темы чаще, сильные реже\n"
-    "• После каждого ответа — объяснение правила\n\n"
+    "• Первые 3 дня - знакомство с твоим уровнем\n"
+    "• С 4-го дня - умная адаптация: слабые темы чаще, сильные реже\n"
+    "• После каждого ответа - объяснение правила\n\n"
     "💶 <b>Стоимость:</b> первые 3 дня бесплатно, затем <b>10 € в месяц</b>.\n"
     "Подписка через Tribute покрывает AI-токены для генерации вопросов.\n\n"
-    "⚠️ <i>Вопросы созданы искусственным интеллектом — возможны неточности.</i>\n\n"
-    "Чтобы начать, расскажи немного о себе — займёт 2 минуты."
+    "⚠️ <i>Вопросы созданы искусственным интеллектом - возможны неточности.</i>\n\n"
+    "Чтобы начать, расскажи немного о себе - займёт 2 минуты."
 )
 
 MAIN_MENU_KEYBOARD = [
@@ -598,7 +598,7 @@ def build_profile_section(profile: dict) -> str:
     if other_langs and other_langs.lower() not in ("нет других", "нет", "no"):
         other_langs_line = f" Другие языки: {other_langs}."
 
-    goal_line = f"Цель: {greek_goal}."
+    goal_line = f"Место применения: {greek_goal}."
     if exam_date:
         if isinstance(exam_date, date):
             goal_line += f" Сдать экзамен {exam_date.strftime('%d.%m.%Y')}."
@@ -619,7 +619,7 @@ def build_system_prompt(profile: dict) -> str:
     """Combine intro + personal profile + static quiz rules into the full system prompt."""
     profile_section = build_profile_section(profile)
     return (
-        "Ты генератор вопросов для квиза по греческому языку уровней A1-A2.\n\n"
+        "Ты генератор вопросов для квиза по греческому языку уровня A2.\n\n"
         + profile_section
         + "\n\n"
         + PROMPT_STATIC
@@ -794,7 +794,7 @@ async def _finish_onboarding(message, user_id, context):
     context.user_data.clear()
     await message.reply_text(
         "✅ Отлично! Анкета заполнена.\n"
-        "Теперь квизы будут персональными — вопросы из твоей жизни.\n\n"
+        "Теперь квизы будут персональными - вопросы из твоей жизни.\n\n"
         "Можно начинать!",
         reply_markup=InlineKeyboardMarkup(MAIN_MENU_KEYBOARD),
     )
@@ -834,6 +834,13 @@ async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_access_allowed(update.effective_user):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
+    if not await _is_onboarding_complete(update.effective_user.id):
+        keyboard = [[InlineKeyboardButton("📋 Заполнить анкету", callback_data="start_onboarding")]]
+        await update.message.reply_text(
+            "Сначала заполни анкету - без этого квиз не запустится.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
     await start_quiz(update.message, update.effective_user.id)
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -844,6 +851,13 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     if query.data == "menu_quiz":
+        if not await _is_onboarding_complete(query.from_user.id):
+            keyboard = [[InlineKeyboardButton("📋 Заполнить анкету", callback_data="start_onboarding")]]
+            await query.message.reply_text(
+                "Сначала заполни анкету - без этого квиз не запустится.",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
         await query.message.reply_text("⏳ Запускаю квиз...")
         await start_quiz(query.message, query.from_user.id)
 
@@ -856,26 +870,25 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "menu_about":
         await query.message.reply_text(
             "📖 <b>О боте</b>\n\n"
-            "Помогает учить современный греческий язык (A1-A2).\n\n"
+            "Помогает учить современный греческий язык (уровень A2).\n\n"
             "<b>Как работает:</b>\n"
-            "• Квизы из 20 вопросов — сколько хочешь в день\n"
+            "• Квизы из 20 вопросов - сколько хочешь в день\n"
             "• Все вопросы генерирует AI на основе твоего профиля\n"
-            "• Первые 3 дня — режим обучения: бот охватывает все темы\n"
-            "• С 4-го дня — адаптивный режим: слабые темы чаще, сильные реже\n"
-            "• После каждого ответа — объяснение правила\n\n"
+            "• Первые 3 дня - режим обучения: бот охватывает все темы\n"
+            "• С 4-го дня - адаптивный режим: слабые темы чаще, сильные реже\n"
+            "• После каждого ответа - объяснение правила\n\n"
             "<b>Команды:</b>\n"
-            "/quiz — начать квиз\n"
-            "/stats — статистика\n"
-            "/settings — настройки профиля\n"
-            "/reset — сбросить историю\n"
-            "/menu — главное меню\n\n"
-            "⚠️ Вопросы генерирует AI — возможны неточности.\n\n"
+            "/quiz - начать квиз\n"
+            "/stats - статистика\n"
+            "/settings - настройки профиля\n"
+            "/menu - главное меню\n\n"
+            "⚠️ Вопросы генерирует AI - возможны неточности.\n\n"
             "Автор: @aparasochka",
             parse_mode="HTML",
         )
 
 async def start_quiz(message, user_id):
-    msg = await message.reply_text("⏳ Готовлю квиз... Это займёт около 15 секунд.")
+    msg = await message.reply_text("⏳ Готовлю квиз... Это займёт около минуты.")
     try:
         stats, session_dates = await _load_compact_data(user_id)
         profile = await _load_profile(user_id) or {}
@@ -1081,6 +1094,28 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── Reset stats (from settings menu) ──
+    if data == "reset_ask":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        keyboard = [[
+            InlineKeyboardButton("🗑 Да, удалить всё", callback_data="reset_confirm"),
+            InlineKeyboardButton("❌ Отмена",           callback_data="reset_cancel"),
+        ]]
+        await query.message.reply_text(
+            "⚠️ <b>Сброс статистики</b>\n\n"
+            "Это удалит <b>все твои данные</b>:\n"
+            "- Все ответы на вопросы\n"
+            "- Накопленную статистику по темам\n"
+            "- Историю дней и серию\n\n"
+            "Продолжить?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
+        return
+
     # ── Reset confirmation ──
     if data == "reset_confirm":
         try:
@@ -1272,9 +1307,9 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚠️ <b>Сброс истории</b>\n\n"
         "Это удалит <b>все твои данные</b>:\n"
-        "• Все ответы на вопросы\n"
-        "• Накопленную статистику по темам\n"
-        "• Историю дней и серию\n\n"
+        "- Все ответы на вопросы\n"
+        "- Накопленную статистику по темам\n"
+        "- Историю дней и серию\n\n"
         "Продолжить?",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML",
@@ -1315,7 +1350,7 @@ async def show_stats(message, user_id: int):
             exam_line = f"📅 До экзамена: <b>{days_left} дней</b>\n"
 
     learning_status = (
-        f"🎓 <b>Идёт обучение</b> ({learning_days} из 3 дней) — бот собирает статистику\n"
+        f"🎓 <b>Идёт обучение</b> ({learning_days} из 3 дней) - бот собирает статистику\n"
         if is_learning else ""
     )
 
@@ -1425,10 +1460,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 PROFILE_FIELD_LABELS = {
     "display_name": "Имя",       "age":        "Возраст",
-    "city":         "Город",     "native_lang": "Родной язык",
+    "city":         "Город проживания", "native_lang": "Родной язык",
     "other_langs":  "Другие языки", "occupation": "Работа/занятие",
     "family":       "Семья",     "hobbies":     "Хобби",
-    "greek_goal":   "Цель изучения", "exam_date": "Дата экзамена",
+    "greek_goal":   "Место применения", "exam_date": "Дата экзамена",
 }
 
 
@@ -1446,13 +1481,13 @@ def _format_profile(profile: dict) -> str:
         "👤 <b>Твой профиль</b>\n\n"
         f"Имя: {h(_v('display_name'))}\n"
         f"Возраст: {h(_v('age'))}\n"
-        f"Город: {h(_v('city'))}\n"
+        f"Город проживания: {h(_v('city'))}\n"
         f"Родной язык: {h(_v('native_lang'))}\n"
         f"Другие языки: {h(_v('other_langs'))}\n"
         f"Работа/занятие: {h(_v('occupation'))}\n"
         f"Семья: {h(_v('family_status'))}\n"
         f"Хобби: {h(_v('hobbies'))}\n"
-        f"Цель изучения: {h(_v('greek_goal'))}\n"
+        f"Место применения: {h(_v('greek_goal'))}\n"
         f"Дата экзамена: {h(_v('exam_date'))}"
     )
 
@@ -1460,10 +1495,11 @@ def _format_profile(profile: dict) -> str:
 async def settings_menu(message):
     """Show the settings menu (called from /settings command or menu button)."""
     keyboard = [
-        [InlineKeyboardButton("👤 Мой профиль",      callback_data="settings_view")],
-        [InlineKeyboardButton("✏️ Изменить данные",   callback_data="settings_edit_menu")],
-        [InlineKeyboardButton("🗑 Сбросить профиль",  callback_data="settings_reset_ask")],
-        [InlineKeyboardButton("◀️ Назад",             callback_data="settings_back")],
+        [InlineKeyboardButton("👤 Мой профиль",          callback_data="settings_view")],
+        [InlineKeyboardButton("✏️ Изменить данные",       callback_data="settings_edit_menu")],
+        [InlineKeyboardButton("🗑 Сбросить статистику",   callback_data="reset_ask")],
+        [InlineKeyboardButton("🗑 Сбросить профиль",      callback_data="settings_reset_ask")],
+        [InlineKeyboardButton("◀️ Назад",                 callback_data="settings_back")],
     ]
     await message.reply_text("⚙️ Настройки", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -1508,16 +1544,58 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await settings_menu(update.message)
 
 
+async def daily_quiz_reminder(app):
+    """Background task: at 18:00 Athens time send quiz reminder to users who haven't played today."""
+    # Athens timezone: UTC+2 (EET winter) / UTC+3 (EEST summer).
+    # Simple approach: use UTC+2 fixed offset as a conservative estimate.
+    ATHENS_OFFSET = timedelta(hours=2)
+    while True:
+        now_utc = datetime.utcnow()
+        now_athens = now_utc + ATHENS_OFFSET
+        # Next 18:00 Athens
+        target_athens = now_athens.replace(hour=18, minute=0, second=0, microsecond=0)
+        if now_athens >= target_athens:
+            target_athens += timedelta(days=1)
+        wait_secs = (target_athens - now_athens).total_seconds()
+        await asyncio.sleep(wait_secs)
+
+        today_utc = (datetime.utcnow() + ATHENS_OFFSET).strftime("%Y-%m-%d")
+        try:
+            async with _acquire() as conn:
+                users = await conn.fetch("""
+                    SELECT u.telegram_id FROM users u
+                    WHERE u.onboarding_complete = TRUE
+                    AND u.telegram_id NOT IN (
+                        SELECT DISTINCT qs.user_id FROM quiz_sessions qs
+                        WHERE qs.session_date = $1
+                    )
+                """, today_utc)
+            for user in users:
+                try:
+                    await app.bot.send_message(
+                        chat_id=user["telegram_id"],
+                        text=(
+                            "🔔 Сегодня ещё не было квиза!\n\n"
+                            "Нажми /quiz чтобы пройти - это займёт около минуты."
+                        ),
+                    )
+                    await asyncio.sleep(0.05)
+                except Exception as e:
+                    print(f"[reminder] failed for {user['telegram_id']}: {e}")
+        except Exception as e:
+            print(f"[reminder] DB error: {e}")
+
+
 async def post_init(app):
     # Delete any stale webhook so polling can start without a Conflict right away.
     await app.bot.delete_webhook(drop_pending_updates=True)
     await init_db()
+    asyncio.create_task(daily_quiz_reminder(app))
     await app.bot.set_my_commands([
         BotCommand("start",    "Главное меню"),
         BotCommand("quiz",     "Начать квиз"),
         BotCommand("stats",    "Моя статистика"),
         BotCommand("settings", "Настройки профиля"),
-        BotCommand("reset",    "Сбросить историю"),
         BotCommand("menu",     "Главное меню"),
     ])
 
