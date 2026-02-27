@@ -38,12 +38,13 @@ async def _acquire():
 LETTERS = ["А", "Б", "В", "Г"]
 
 OWNER_USERNAME = "aparasochka"
+ALLOWED_USERNAMES = {OWNER_USERNAME, "immangosteen"}
 TRIBUTE_URL = os.environ.get("TRIBUTE_URL", "https://t.me/tribute")
 
 
 def is_access_allowed(user) -> bool:
-    """Currently only the owner has access. Future: check subscription_status."""
-    return user.username == OWNER_USERNAME
+    """Currently only allowed users have access. Future: check subscription_status."""
+    return user.username in ALLOWED_USERNAMES
 
 
 # ─── Onboarding ───────────────────────────────────────────────────────────────
