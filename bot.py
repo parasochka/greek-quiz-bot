@@ -38,7 +38,7 @@ async def _acquire():
 LETTERS = ["А", "Б", "В", "Г"]
 
 OWNER_USERNAME = "aparasochka"
-ALLOWED_USERNAMES = {OWNER_USERNAME, "immangosteen"}
+ALLOWED_USERNAMES = {OWNER_USERNAME, "immangosteen", "holycolorama", "akulovv"}
 TRIBUTE_URL = os.environ.get("TRIBUTE_URL", "https://t.me/tribute")
 
 
