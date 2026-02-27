@@ -342,6 +342,10 @@ def build_prompt(stats, session_dates):
 
     Dynamic prompt size is O(number_of_topics) — never grows with raw history length.
     """
+    # Learning period: first 5 unique quiz days — collect broad statistics before adapting
+    learning_days = len(session_dates)
+    is_learning = learning_days < 5
+
     days_away = days_since_last_session(session_dates)
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -370,8 +374,17 @@ def build_prompt(stats, session_dates):
             + "\n".join(f"  ⚪ {t}" for t in unseen)
         )
 
+    learning_note = ""
+    if is_learning:
+        learning_note = (
+            f"РЕЖИМ ОБУЧЕНИЯ (день {learning_days + 1} из 5): статистики пока недостаточно для точной адаптации. "
+            f"Игнорируй процентные приоритеты по слабым/сильным темам из системного промпта — они применяются только после 5 дней обучения. "
+            f"Равномерно охватывай все темы, вводи 4-5 новых тем за квиз. "
+            f"Цель — собрать базовую статистику по максимуму тем.\n"
+        )
+
     review_note = ""
-    if days_away >= 2:
+    if not is_learning and days_away >= 2:
         review_note = (
             "ВАЖНО: ученик не занимался более 2 дней. "
             "Первые 8 вопросов строго из уже пройденного материала (повторение). "
@@ -390,6 +403,7 @@ def build_prompt(stats, session_dates):
 
     return (
         f"До экзамена: {days_left} дней.\n"
+        f"{learning_note}"
         f"{review_note}"
         f"{pre_exam_note}"
         f"Статистика ученика по темам (накопленная за всё время):\n"
@@ -799,9 +813,9 @@ async def show_stats(message):
         return
 
     streak_cur, streak_best = calc_streak(session_dates)
-    total_sessions  = len(session_dates)
     total_questions = sum(s["total"]   for s in stats.values())
     total_correct   = sum(s["correct"] for s in stats.values())
+    total_sessions  = total_questions // 20  # each quiz is exactly 20 questions
     overall_pct     = round(total_correct / total_questions * 100) if total_questions else 0
 
     exam_date  = datetime(2026, 5, 19)
