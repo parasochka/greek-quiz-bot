@@ -1,9 +1,11 @@
 import os
+import re
 import json
 import html
 import random
 import asyncio
 import difflib
+import contextlib
 import asyncpg
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -14,14 +16,93 @@ import anthropic
 ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
 _raw_db_url = os.environ.get("DATABASE_URL")
-if not _raw_db_url:
-    raise RuntimeError(
-        "DATABASE_URL environment variable is not set. "
-        "Please configure it in your deployment environment."
-    )
-DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1)
+DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1) if _raw_db_url else None
+USE_POSTGRES = bool(DATABASE_URL)
+SQLITE_PATH = "quiz_bot.db"
+
+try:
+    import aiosqlite as _aiosqlite
+except ImportError:
+    _aiosqlite = None
 
 db_pool = None
+
+
+# ─── DB backend adapter ────────────────────────────────────────────────────────
+
+def _q(sql: str) -> str:
+    """Convert PostgreSQL $N placeholders to SQLite ? style."""
+    return sql if USE_POSTGRES else re.sub(r'\$\d+', '?', sql)
+
+
+class _Conn:
+    """Thin adapter so asyncpg and aiosqlite share the same call interface."""
+
+    def __init__(self, conn, is_pg: bool):
+        self._c = conn
+        self._pg = is_pg
+
+    async def fetch(self, sql: str, *args):
+        if self._pg:
+            return await self._c.fetch(sql, *args)
+        async with self._c.execute(_q(sql), args) as cur:
+            return await cur.fetchall()
+
+    async def fetchval(self, sql: str, *args):
+        if self._pg:
+            return await self._c.fetchval(sql, *args)
+        # Handle "INSERT ... RETURNING id" for SQLite via lastrowid
+        m = re.search(r'\s+RETURNING\s+\w+\s*$', sql, re.IGNORECASE)
+        if m:
+            async with self._c.execute(_q(sql[:m.start()]), args) as cur:
+                return cur.lastrowid
+        async with self._c.execute(_q(sql), args) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+    async def execute(self, sql: str, *args):
+        if self._pg:
+            return await self._c.execute(sql, *args)
+        await self._c.execute(_q(sql), args)
+
+    async def executemany(self, sql: str, args_list):
+        if self._pg:
+            return await self._c.executemany(sql, args_list)
+        # Convert bool to int for SQLite
+        converted = [
+            tuple(int(v) if isinstance(v, bool) else v for v in row)
+            for row in args_list
+        ]
+        await self._c.executemany(_q(sql), converted)
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        if self._pg:
+            async with self._c.transaction():
+                yield
+        else:
+            try:
+                yield
+                await self._c.commit()
+            except Exception:
+                await self._c.rollback()
+                raise
+
+
+@contextlib.asynccontextmanager
+async def _acquire():
+    """Yield a _Conn wrapping either an asyncpg or aiosqlite connection."""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            yield _Conn(conn, is_pg=True)
+    else:
+        if _aiosqlite is None:
+            raise RuntimeError("aiosqlite is not installed. Run: pip install aiosqlite")
+        async with _aiosqlite.connect(SQLITE_PATH) as conn:
+            conn.row_factory = _aiosqlite.Row
+            await conn.execute("PRAGMA foreign_keys = ON")
+            yield _Conn(conn, is_pg=False)
+
 
 LETTERS = ["А", "Б", "В", "Г"]
 
@@ -83,45 +164,87 @@ def h(text):
 
 async def init_db():
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id BIGINT PRIMARY KEY,
-                username    VARCHAR(255),
-                first_name  VARCHAR(255),
-                created_at  TIMESTAMPTZ DEFAULT NOW()
-            );
-            CREATE TABLE IF NOT EXISTS quiz_sessions (
-                id              SERIAL PRIMARY KEY,
-                user_id         BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
-                session_date    DATE NOT NULL,
-                completed_at    TIMESTAMPTZ DEFAULT NOW(),
-                correct_answers INT,
-                total_questions INT DEFAULT 20
-            );
-            CREATE TABLE IF NOT EXISTS answers (
-                id            SERIAL PRIMARY KEY,
-                user_id       BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
-                session_id    INT REFERENCES quiz_sessions(id) ON DELETE CASCADE,
-                answered_at   TIMESTAMPTZ DEFAULT NOW(),
-                topic         VARCHAR(100) NOT NULL,
-                question_type VARCHAR(20)  NOT NULL,
-                correct       BOOLEAN      NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS topic_stats (
-                user_id   BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
-                topic     VARCHAR(100) NOT NULL,
-                correct   INT  DEFAULT 0,
-                total     INT  DEFAULT 0,
-                last_seen DATE,
-                PRIMARY KEY (user_id, topic)
-            );
-        """)
+    if USE_POSTGRES:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_id BIGINT PRIMARY KEY,
+                    username    VARCHAR(255),
+                    first_name  VARCHAR(255),
+                    created_at  TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS quiz_sessions (
+                    id              SERIAL PRIMARY KEY,
+                    user_id         BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                    session_date    DATE NOT NULL,
+                    completed_at    TIMESTAMPTZ DEFAULT NOW(),
+                    correct_answers INT,
+                    total_questions INT DEFAULT 20
+                );
+                CREATE TABLE IF NOT EXISTS answers (
+                    id            SERIAL PRIMARY KEY,
+                    user_id       BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                    session_id    INT REFERENCES quiz_sessions(id) ON DELETE CASCADE,
+                    answered_at   TIMESTAMPTZ DEFAULT NOW(),
+                    topic         VARCHAR(100) NOT NULL,
+                    question_type VARCHAR(20)  NOT NULL,
+                    correct       BOOLEAN      NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS topic_stats (
+                    user_id   BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                    topic     VARCHAR(100) NOT NULL,
+                    correct   INT  DEFAULT 0,
+                    total     INT  DEFAULT 0,
+                    last_seen DATE,
+                    PRIMARY KEY (user_id, topic)
+                );
+            """)
+    else:
+        if _aiosqlite is None:
+            raise RuntimeError("aiosqlite is not installed. Run: pip install aiosqlite")
+        print("[INFO] DATABASE_URL not set — using SQLite at", SQLITE_PATH)
+        async with _aiosqlite.connect(SQLITE_PATH) as conn:
+            await conn.execute("PRAGMA foreign_keys = ON")
+            for stmt in [
+                """CREATE TABLE IF NOT EXISTS users (
+                    telegram_id INTEGER PRIMARY KEY,
+                    username    TEXT,
+                    first_name  TEXT,
+                    created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+                )""",
+                """CREATE TABLE IF NOT EXISTS quiz_sessions (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id         INTEGER REFERENCES users(telegram_id) ON DELETE CASCADE,
+                    session_date    TEXT NOT NULL,
+                    completed_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+                    correct_answers INTEGER,
+                    total_questions INTEGER DEFAULT 20
+                )""",
+                """CREATE TABLE IF NOT EXISTS answers (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id       INTEGER REFERENCES users(telegram_id) ON DELETE CASCADE,
+                    session_id    INTEGER REFERENCES quiz_sessions(id) ON DELETE CASCADE,
+                    answered_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+                    topic         TEXT NOT NULL,
+                    question_type TEXT NOT NULL,
+                    correct       INTEGER NOT NULL
+                )""",
+                """CREATE TABLE IF NOT EXISTS topic_stats (
+                    user_id   INTEGER REFERENCES users(telegram_id) ON DELETE CASCADE,
+                    topic     TEXT NOT NULL,
+                    correct   INTEGER DEFAULT 0,
+                    total     INTEGER DEFAULT 0,
+                    last_seen TEXT,
+                    PRIMARY KEY (user_id, topic)
+                )""",
+            ]:
+                await conn.execute(stmt)
+            await conn.commit()
 
 
 async def register_user(user):
-    async with db_pool.acquire() as conn:
+    async with _acquire() as conn:
         await conn.execute(
             "INSERT INTO users (telegram_id, username, first_name) "
             "VALUES ($1, $2, $3) ON CONFLICT (telegram_id) DO NOTHING",
@@ -136,7 +259,7 @@ async def _load_compact_data(user_id: int):
       stats        — {topic: {correct, total, last_seen}}
       session_dates — sorted list of YYYY-MM-DD strings
     """
-    async with db_pool.acquire() as conn:
+    async with _acquire() as conn:
         stats_rows = await conn.fetch(
             "SELECT topic, correct, total, last_seen FROM topic_stats WHERE user_id=$1",
             user_id,
@@ -161,7 +284,7 @@ async def _load_compact_data(user_id: int):
 async def _load_history_for_stats(user_id: int):
     """Load full answers only for /stats display (infrequent). Not used on quiz start."""
     try:
-        async with db_pool.acquire() as conn:
+        async with _acquire() as conn:
             rows = await conn.fetch(
                 "SELECT topic, question_type AS type, correct FROM answers WHERE user_id=$1",
                 user_id,
@@ -179,7 +302,22 @@ async def _save_all(user_id: int, answers: list):
       2. Bulk-insert raw answer rows
       3. Upsert topic_stats (increment correct/total, update last_seen)
     """
-    async with db_pool.acquire() as conn:
+    upsert_sql = (
+        "INSERT INTO topic_stats (user_id, topic, correct, total, last_seen) "
+        "VALUES ($1, $2, $3, 1, CURRENT_DATE) "
+        "ON CONFLICT (user_id, topic) DO UPDATE SET "
+        "  correct   = topic_stats.correct + $3, "
+        "  total     = topic_stats.total + 1, "
+        "  last_seen = CURRENT_DATE"
+        if USE_POSTGRES else
+        "INSERT INTO topic_stats (user_id, topic, correct, total, last_seen) "
+        "VALUES (?, ?, ?, 1, CURRENT_DATE) "
+        "ON CONFLICT (user_id, topic) DO UPDATE SET "
+        "  correct   = topic_stats.correct + excluded.correct, "
+        "  total     = topic_stats.total + 1, "
+        "  last_seen = CURRENT_DATE"
+    )
+    async with _acquire() as conn:
         async with conn.transaction():
             correct_count = sum(1 for a in answers if a["correct"])
             session_id = await conn.fetchval(
@@ -194,12 +332,7 @@ async def _save_all(user_id: int, answers: list):
             )
             for a in answers:
                 await conn.execute(
-                    "INSERT INTO topic_stats (user_id, topic, correct, total, last_seen) "
-                    "VALUES ($1, $2, $3, 1, CURRENT_DATE) "
-                    "ON CONFLICT (user_id, topic) DO UPDATE SET "
-                    "  correct   = topic_stats.correct + $3, "
-                    "  total     = topic_stats.total + 1, "
-                    "  last_seen = CURRENT_DATE",
+                    upsert_sql,
                     user_id, a["topic"], 1 if a["correct"] else 0,
                 )
 
@@ -208,7 +341,7 @@ async def _clear_all(user_id: int):
     """
     Wipe answers, quiz_sessions, topic_stats for this user. Returns number of answers deleted.
     """
-    async with db_pool.acquire() as conn:
+    async with _acquire() as conn:
         async with conn.transaction():
             count = await conn.fetchval(
                 "SELECT COUNT(*) FROM answers WHERE user_id=$1", user_id,
