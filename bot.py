@@ -12,9 +12,18 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from telegram.error import Conflict
 import anthropic
 
-ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
-TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
-DATABASE_URL = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://", 1)
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise SystemExit(
+            f"ERROR: Required environment variable '{name}' is not set.\n"
+            f"Add it to your deployment settings (Railway → Variables)."
+        )
+    return value
+
+ANTHROPIC_KEY = _require_env("ANTHROPIC_API_KEY")
+TG_TOKEN = _require_env("TELEGRAM_TOKEN")
+DATABASE_URL = _require_env("DATABASE_URL").replace("postgres://", "postgresql://", 1)
 
 db_pool = None
 
