@@ -971,9 +971,12 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         await query.edit_message_reply_markup(reply_markup=None)
-        parts = data.split("_")  # onb_<key>_<idx>
-        key = parts[1]
-        opt_idx = int(parts[2])
+        # Remove "onb_" prefix then split on the LAST underscore so that
+        # keys containing underscores (e.g. "native_lang", "other_langs") are
+        # parsed correctly.
+        remainder = data[4:]  # strip "onb_"
+        key, _, opt_idx_str = remainder.rpartition("_")
+        opt_idx = int(opt_idx_str)
         step = next(s for s in ONBOARDING_STEPS if s["key"] == key)
         value = step["options"][opt_idx]
         context.user_data.setdefault("onboarding_data", {})[key] = value
@@ -1046,9 +1049,12 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         await query.edit_message_reply_markup(reply_markup=None)
-        parts = data.split("_")  # setopt_<key>_<idx>
-        field = parts[1]
-        opt_idx = int(parts[2])
+        # Remove "setopt_" prefix then split on the LAST underscore so that
+        # fields containing underscores (e.g. "native_lang", "other_langs")
+        # are parsed correctly.
+        remainder = data[7:]  # strip "setopt_"
+        field, _, opt_idx_str = remainder.rpartition("_")
+        opt_idx = int(opt_idx_str)
         step = next(s for s in ONBOARDING_STEPS if s["key"] == field)
         value = step["options"][opt_idx]
         await _update_profile_field(user_id, field, value)
