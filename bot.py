@@ -1,4 +1,5 @@
 import os
+import signal
 import json
 import html
 import random
@@ -1469,23 +1470,36 @@ async def settings_menu(message):
 
 # ─── Main ───────────────────────────────────────────────────────────────────────
 
+_bot_start_time = datetime.now()
 _conflict_count = 0
 
 async def conflict_error_handler(update, context):
-    """Handle Conflict errors that appear when a new deploy starts while the
-    previous container is still shutting down.  Each call backs off a bit
-    longer (up to 30 s) so the two instances don't keep hammering each other
-    and the old one gets time to receive SIGTERM and exit cleanly."""
+    """Handle Conflict errors that arise when two bot instances run simultaneously.
+
+    Strategy:
+    - NEW instance  (uptime < 30 s): back off and retry — the old container is
+      still alive but Railway will kill it shortly via SIGTERM.
+    - OLD instance  (uptime ≥ 30 s): we were running fine and a new deployment
+      just stole our getUpdates slot.  Send ourselves SIGTERM so run_polling's
+      built-in signal handler shuts us down cleanly and the new instance wins.
+    """
     global _conflict_count
-    if isinstance(context.error, Conflict):
-        _conflict_count += 1
-        wait = min(5 * _conflict_count, 30)
-        print(f"[WARN] Conflict: another bot instance still running "
-              f"(attempt {_conflict_count}), backing off {wait}s …")
-        await asyncio.sleep(wait)
+    if not isinstance(context.error, Conflict):
+        _conflict_count = 0
+        raise context.error
+
+    _conflict_count += 1
+    uptime_s = (datetime.now() - _bot_start_time).total_seconds()
+
+    if uptime_s > 30:
+        print(f"[WARN] Conflict after {uptime_s:.0f}s uptime — new deployment detected, "
+              f"shutting down this instance to yield to the new one.")
+        os.kill(os.getpid(), signal.SIGTERM)
         return
-    _conflict_count = 0
-    raise context.error
+
+    wait = min(5 * _conflict_count, 30)
+    print(f"[WARN] Conflict at startup (attempt {_conflict_count}), backing off {wait}s …")
+    await asyncio.sleep(wait)
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_access_allowed(update.effective_user):
