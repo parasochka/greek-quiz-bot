@@ -4,9 +4,8 @@ import html
 import random
 import asyncio
 import difflib
-import gspread
+import asyncpg
 from datetime import datetime, timedelta
-from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.error import Conflict
@@ -14,8 +13,9 @@ import anthropic
 
 ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
-SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
-GOOGLE_CREDS = json.loads(os.environ["GOOGLE_CREDS_JSON"])
+DATABASE_URL = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://", 1)
+
+db_pool = None
 
 LETTERS = ["А", "Б", "В", "Г"]
 
@@ -64,155 +64,161 @@ def normalize_topic(topic: str) -> str:
 def h(text):
     return html.escape(str(text))
 
-# ─── Google Sheets ─────────────────────────────────────────────────────────────
+# ─── Database (Railway PostgreSQL) ─────────────────────────────────────────────
 #
-# THREE worksheets:
-#   History  — raw audit log: date, topic, type, correct
-#   Stats    — per-topic all-time aggregates: topic, correct, total, last_seen
-#              (loaded on every quiz start — always tiny, O(topics) rows)
-#   Sessions — one row per unique quiz date, for streak calculation
+# FOUR tables:
+#   users        — registered Telegram users
+#   quiz_sessions — one row per completed quiz
+#   answers      — raw audit log: topic, type, correct per question
+#   topic_stats  — per-topic all-time aggregates (upserted after each quiz)
 #
-# build_prompt() uses Stats + Sessions only → token cost is O(topics), never
-# grows with raw history size. History is kept for auditing / future analysis.
+# build_prompt() uses topic_stats + quiz_sessions only → token cost is O(topics).
+# answers is kept for /stats display and future analysis.
 
-def _open_spreadsheet():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(GOOGLE_CREDS, scopes=scopes)
-    return gspread.authorize(creds).open_by_key(SHEET_ID)
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id BIGINT PRIMARY KEY,
+                username    VARCHAR(255),
+                first_name  VARCHAR(255),
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS quiz_sessions (
+                id              SERIAL PRIMARY KEY,
+                user_id         BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                session_date    DATE NOT NULL,
+                completed_at    TIMESTAMPTZ DEFAULT NOW(),
+                correct_answers INT,
+                total_questions INT DEFAULT 20
+            );
+            CREATE TABLE IF NOT EXISTS answers (
+                id            SERIAL PRIMARY KEY,
+                user_id       BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                session_id    INT REFERENCES quiz_sessions(id) ON DELETE CASCADE,
+                answered_at   TIMESTAMPTZ DEFAULT NOW(),
+                topic         VARCHAR(100) NOT NULL,
+                question_type VARCHAR(20)  NOT NULL,
+                correct       BOOLEAN      NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS topic_stats (
+                user_id   BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                topic     VARCHAR(100) NOT NULL,
+                correct   INT  DEFAULT 0,
+                total     INT  DEFAULT 0,
+                last_seen DATE,
+                PRIMARY KEY (user_id, topic)
+            );
+        """)
 
-def _get_or_create_ws(sh, name, rows, cols, header):
-    try:
-        return sh.worksheet(name)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(name, rows, cols)
-        ws.append_row(header)
-        return ws
 
-def _load_compact_data():
+async def register_user(user):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (telegram_id, username, first_name) "
+            "VALUES ($1, $2, $3) ON CONFLICT (telegram_id) DO NOTHING",
+            user.id, user.username, user.first_name,
+        )
+
+
+async def _load_compact_data(user_id: int):
     """
-    Load Stats + Sessions — compact, fast, fixed size regardless of history length.
+    Load topic_stats + session dates — compact, fast, fixed size regardless of history length.
     Returns:
       stats        — {topic: {correct, total, last_seen}}
       session_dates — sorted list of YYYY-MM-DD strings
     """
-    sh = _open_spreadsheet()
-
-    stats_ws = _get_or_create_ws(sh, "Stats", 200, 4, ["topic", "correct", "total", "last_seen"])
-    stats = {}
-    for r in stats_ws.get_all_records():
-        t = r.get("topic", "")
-        if not t:
-            continue
-        stats[t] = {
-            "correct": int(r.get("correct", 0)),
-            "total":   int(r.get("total",   0)),
-            "last_seen": r.get("last_seen", ""),
+    async with db_pool.acquire() as conn:
+        stats_rows = await conn.fetch(
+            "SELECT topic, correct, total, last_seen FROM topic_stats WHERE user_id=$1",
+            user_id,
+        )
+        date_rows = await conn.fetch(
+            "SELECT DISTINCT session_date FROM quiz_sessions "
+            "WHERE user_id=$1 ORDER BY session_date",
+            user_id,
+        )
+    stats = {
+        r["topic"]: {
+            "correct":   r["correct"],
+            "total":     r["total"],
+            "last_seen": str(r["last_seen"]) if r["last_seen"] else "",
         }
-
-    sess_ws = _get_or_create_ws(sh, "Sessions", 1000, 1, ["date"])
-    session_dates = sorted(set(d for d in sess_ws.col_values(1)[1:] if d))
-
+        for r in stats_rows
+    }
+    session_dates = [str(r["session_date"]) for r in date_rows]
     return stats, session_dates
 
-def _load_history_for_stats():
-    """Load full History only for /stats display (infrequent). Not used on quiz start."""
+
+async def _load_history_for_stats(user_id: int):
+    """Load full answers only for /stats display (infrequent). Not used on quiz start."""
     try:
-        sh = _open_spreadsheet()
-        ws = _get_or_create_ws(sh, "History", 10000, 4, ["date", "topic", "type", "correct"])
-        return ws.get_all_records()
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT topic, question_type AS type, correct FROM answers WHERE user_id=$1",
+                user_id,
+            )
+        return [{"topic": r["topic"], "type": r["type"], "correct": r["correct"]} for r in rows]
     except Exception as e:
         print(f"Load history error: {e}")
         return []
 
-def _save_all(answers):
+
+async def _save_all(user_id: int, answers: list):
     """
-    Persist one quiz session:
-      1. Append raw rows to History
-      2. Incrementally update Stats (rewrite sheet — one clear + one update call)
-      3. Add today's date to Sessions (if not already present)
+    Persist one quiz session atomically:
+      1. Insert a quiz_sessions row
+      2. Bulk-insert raw answer rows
+      3. Upsert topic_stats (increment correct/total, update last_seen)
     """
-    sh = _open_spreadsheet()
-    today = datetime.now().strftime("%Y-%m-%d")
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            correct_count = sum(1 for a in answers if a["correct"])
+            session_id = await conn.fetchval(
+                "INSERT INTO quiz_sessions (user_id, session_date, correct_answers, total_questions) "
+                "VALUES ($1, CURRENT_DATE, $2, $3) RETURNING id",
+                user_id, correct_count, len(answers),
+            )
+            await conn.executemany(
+                "INSERT INTO answers (user_id, session_id, topic, question_type, correct) "
+                "VALUES ($1, $2, $3, $4, $5)",
+                [(user_id, session_id, a["topic"], a["type"], a["correct"]) for a in answers],
+            )
+            for a in answers:
+                await conn.execute(
+                    "INSERT INTO topic_stats (user_id, topic, correct, total, last_seen) "
+                    "VALUES ($1, $2, $3, 1, CURRENT_DATE) "
+                    "ON CONFLICT (user_id, topic) DO UPDATE SET "
+                    "  correct   = topic_stats.correct + $3, "
+                    "  total     = topic_stats.total + 1, "
+                    "  last_seen = CURRENT_DATE",
+                    user_id, a["topic"], 1 if a["correct"] else 0,
+                )
 
-    # 1. Raw history
-    hist_ws = _get_or_create_ws(sh, "History", 10000, 4, ["date", "topic", "type", "correct"])
-    hist_ws.append_rows([[today, a["topic"], a["type"], str(a["correct"])] for a in answers])
 
-    # 2. Stats — load existing, merge today's answers, rewrite
-    stats_ws = _get_or_create_ws(sh, "Stats", 200, 4, ["topic", "correct", "total", "last_seen"])
-    existing = {}
-    for r in stats_ws.get_all_records():
-        t = r.get("topic", "")
-        if t:
-            existing[t] = {"correct": int(r.get("correct", 0)),
-                           "total":   int(r.get("total",   0)),
-                           "last_seen": r.get("last_seen", "")}
-
-    old_row_count = len(existing) + 1  # header + data rows currently in the sheet
-
-    for a in answers:
-        t = a["topic"]
-        if t not in existing:
-            existing[t] = {"correct": 0, "total": 0, "last_seen": ""}
-        existing[t]["total"] += 1
-        if a["correct"]:
-            existing[t]["correct"] += 1
-        existing[t]["last_seen"] = today
-
-    rows = [["topic", "correct", "total", "last_seen"]]
-    rows += [[t, s["correct"], s["total"], s["last_seen"]] for t, s in existing.items()]
-
-    # Write new data FIRST — if this call succeeds, the data is safe.
-    # Only then trim stale trailing rows left from a prior (larger) Stats sheet.
-    # Previously: stats_ws.clear() → stats_ws.update() was not atomic:
-    # a failure after clear() would wipe all accumulated statistics permanently.
-    stats_ws.update(range_name="A1", values=rows)
-    if old_row_count > len(rows):
-        stats_ws.delete_rows(len(rows) + 1, old_row_count)
-
-    # 3. Sessions — add today if new
-    sess_ws = _get_or_create_ws(sh, "Sessions", 1000, 1, ["date"])
-    if today not in sess_ws.col_values(1)[1:]:
-        sess_ws.append_row([today])
-
-def _clear_all():
+async def _clear_all(user_id: int):
     """
-    Wipe History, Stats, Sessions — keep headers. Returns number of history rows deleted.
+    Wipe answers, quiz_sessions, topic_stats for this user. Returns number of answers deleted.
     """
-    sh = _open_spreadsheet()
-    count = 0
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM answers WHERE user_id=$1", user_id,
+            )
+            await conn.execute("DELETE FROM answers WHERE user_id=$1", user_id)
+            await conn.execute("DELETE FROM quiz_sessions WHERE user_id=$1", user_id)
+            await conn.execute("DELETE FROM topic_stats WHERE user_id=$1", user_id)
+            return count
 
-    # History
-    try:
-        ws = sh.worksheet("History")
-        vals = ws.get_all_values()
-        count = max(0, len(vals) - 1)
-        if count > 0:
-            ws.delete_rows(2, len(vals))
-    except Exception:
-        pass
 
-    # Stats and Sessions — clear and restore header
-    for name, header in [
-        ("Stats",    ["topic", "correct", "total", "last_seen"]),
-        ("Sessions", ["date"]),
-    ]:
-        try:
-            ws = sh.worksheet(name)
-            ws.clear()
-            ws.append_row(header)
-        except Exception:
-            pass
+async def save_result(user_id: int, answers: list):
+    await _save_all(user_id, answers)
 
-    return count
 
-async def save_result(answers):
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _save_all, answers)
-
-async def clear_history():
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _clear_all)
+async def clear_history(user_id: int):
+    return await _clear_all(user_id)
 
 # ─── Stats helpers ─────────────────────────────────────────────────────────────
 
@@ -249,7 +255,7 @@ def type_stats_all(history):
             continue
         stats.setdefault(qt, {"correct": 0, "total": 0})
         stats[qt]["total"] += 1
-        if str(r.get("correct", "")) == "True":
+        if r.get("correct"):
             stats[qt]["correct"] += 1
     return stats
 
@@ -373,8 +379,8 @@ def build_prompt(stats, session_dates):
     """
     Returns only the dynamic part of the prompt — per-session stats + conditional notes.
 
-    stats        — {topic: {correct, total, last_seen}}  (from Stats sheet, compact)
-    session_dates — sorted list of date strings          (from Sessions sheet, compact)
+    stats        — {topic: {correct, total, last_seen}}  (from topic_stats, compact)
+    session_dates — sorted list of date strings          (from quiz_sessions, compact)
 
     Dynamic prompt size is O(number_of_topics) — never grows with raw history length.
     """
@@ -506,6 +512,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.username != ALLOWED_USERNAME:
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
+    await register_user(update.effective_user)
     keyboard = [
         [InlineKeyboardButton("🎯 Начать квиз",    callback_data="menu_quiz")],
         [InlineKeyboardButton("📊 Моя статистика", callback_data="menu_stats")],
@@ -548,7 +555,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_quiz(query.message, query.from_user.id)
 
     elif query.data == "menu_stats":
-        await show_stats(query.message)
+        await show_stats(query.message, query.from_user.id)
 
     elif query.data == "menu_about":
         await query.message.reply_text(
@@ -570,9 +577,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_quiz(message, user_id):
     msg = await message.reply_text("⏳ Готовлю квиз... Это займет около 15 секунд.")
     try:
-        loop = asyncio.get_running_loop()
-        stats, session_dates = await loop.run_in_executor(None, _load_compact_data)
+        stats, session_dates = await _load_compact_data(user_id)
 
+        loop = asyncio.get_running_loop()
         last_exc = None
         questions = None
         for attempt in range(3):
@@ -638,11 +645,11 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await query.edit_message_reply_markup(reply_markup=None)
         try:
-            count = await clear_history()
+            count = await clear_history(user_id)
             await query.message.reply_text(
                 f"🗑 <b>История очищена.</b>\n"
-                f"Удалено строк из History: {count}\n"
-                f"Stats и Sessions также сброшены.\n\n"
+                f"Удалено ответов: {count}\n"
+                f"Статистика по темам и история сессий также сброшены.\n\n"
                 f"Квиз начнёт обучение заново с чистого листа.",
                 parse_mode="HTML",
             )
@@ -797,7 +804,7 @@ async def finish_quiz(message, user_id):
     text += "\n▶️ Для нового квиза напиши /quiz"
 
     try:
-        await save_result(answers)
+        await save_result(user_id, answers)
     except Exception as e:
         print(f"Save error: {e}")
         await message.reply_text(
@@ -820,10 +827,10 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]]
     await update.message.reply_text(
         "⚠️ <b>Сброс истории</b>\n\n"
-        "Это удалит <b>все записи</b> из таблицы Google Sheets:\n"
-        "• History — полный лог ответов\n"
-        "• Stats — накопленная статистика по темам\n"
-        "• Sessions — история дней и серия\n\n"
+        "Это удалит <b>все твои данные</b>:\n"
+        "• Все ответы на вопросы\n"
+        "• Накопленную статистику по темам\n"
+        "• Историю дней и серию\n\n"
         "Продолжить?",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML",
@@ -833,13 +840,11 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.username != ALLOWED_USERNAME:
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
-    await show_stats(update.message)
+    await show_stats(update.message, update.effective_user.id)
 
-async def show_stats(message):
-    loop = asyncio.get_running_loop()
-
+async def show_stats(message, user_id: int):
     try:
-        stats, session_dates = await loop.run_in_executor(None, _load_compact_data)
+        stats, session_dates = await _load_compact_data(user_id)
     except Exception as e:
         await message.reply_text(f"❌ Ошибка загрузки статистики: {e}")
         return
@@ -911,9 +916,9 @@ async def show_stats(message):
         text += f"\n⚪ <b>Ещё не изучались ({len(unseen)}):</b>\n"
         text += ", ".join(h(t) for t in unseen) + "\n"
 
-    # Per question-type accuracy (loaded from full History — infrequent call)
+    # Per question-type accuracy (loaded from full answers — infrequent call)
     try:
-        history = await loop.run_in_executor(None, _load_history_for_stats)
+        history = await _load_history_for_stats(user_id)
         type_st = type_stats_all(history)
         if type_st:
             text += "\n📋 <b>По типам вопросов:</b>\n"
@@ -923,7 +928,7 @@ async def show_stats(message):
                 name = TYPE_NAMES_RU.get(qt, qt)
                 text += f"  {bar} {name}: {pct}% ({s['total']} вопр.)\n"
     except Exception:
-        pass  # type stats are bonus — don't fail show_stats if History load fails
+        pass  # type stats are bonus — don't fail show_stats if history load fails
 
     await message.reply_text(text, parse_mode="HTML")
 
@@ -939,6 +944,7 @@ async def conflict_error_handler(update, context):
     raise context.error
 
 async def post_init(app):
+    await init_db()
     await app.bot.set_my_commands([
         BotCommand("start", "Главное меню"),
         BotCommand("quiz",  "Начать квиз"),
