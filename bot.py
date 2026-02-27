@@ -970,6 +970,116 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_onboarding_step(query.message, next_step, context)
         return
 
+    # ── Settings ──
+    if data == "settings_view":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        profile = await _load_profile(user_id)
+        if not profile:
+            await query.message.reply_text("Профиль не заполнен. Нажми /start чтобы пройти анкету.")
+        else:
+            await query.message.reply_text(
+                _format_profile(profile),
+                parse_mode="HTML",
+            )
+        return
+
+    if data == "settings_edit_menu":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        keyboard = [
+            [InlineKeyboardButton(label, callback_data=f"setedit_{key}")]
+            for key, label in PROFILE_FIELD_LABELS.items()
+        ]
+        keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="settings_back")])
+        await query.message.reply_text(
+            "✏️ Выбери поле для редактирования:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    if data.startswith("setedit_"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        field = data[len("setedit_"):]
+        step = next((s for s in ONBOARDING_STEPS if s["key"] == field), None)
+        label = PROFILE_FIELD_LABELS.get(field, field)
+        if step and step["type"] == "choice":
+            keyboard = [
+                [InlineKeyboardButton(opt, callback_data=f"setopt_{field}_{i}")]
+                for i, opt in enumerate(step["options"])
+            ]
+            await query.message.reply_text(
+                f"✏️ {label}:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        else:
+            context.user_data["state"] = STATE_SETTINGS_EDIT
+            context.user_data["field"] = field
+            await query.message.reply_text(f"✏️ Введи новое значение для «{label}»:")
+        return
+
+    if data.startswith("setopt_"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_reply_markup(reply_markup=None)
+        parts = data.split("_")  # setopt_<key>_<idx>
+        field = parts[1]
+        opt_idx = int(parts[2])
+        step = next(s for s in ONBOARDING_STEPS if s["key"] == field)
+        value = step["options"][opt_idx]
+        await _update_profile_field(user_id, field, value)
+        label = PROFILE_FIELD_LABELS.get(field, field)
+        await query.message.reply_text(f"✅ Поле «{label}» обновлено: {value}")
+        return
+
+    if data == "settings_reset_ask":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        keyboard = [[
+            InlineKeyboardButton("🗑 Да, сбросить", callback_data="settings_reset_confirm"),
+            InlineKeyboardButton("❌ Отмена",        callback_data="settings_back"),
+        ]]
+        await query.message.reply_text(
+            "⚠️ Профиль будет удалён и анкету придётся пройти заново.\nПродолжить?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    if data == "settings_reset_confirm":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_reply_markup(reply_markup=None)
+        await _reset_profile(user_id)
+        context.user_data.clear()
+        await query.message.reply_text(
+            "✅ Профиль сброшен. Нажми /start чтобы пройти анкету заново."
+        )
+        return
+
+    if data == "settings_back":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.message.reply_text(
+            "📋 Главное меню:",
+            reply_markup=InlineKeyboardMarkup(MAIN_MENU_KEYBOARD),
+        )
+        return
+
     # ── Reset confirmation ──
     if data == "reset_confirm":
         try:
@@ -1319,6 +1429,31 @@ PROFILE_FIELD_LABELS = {
     "family":       "Семья",     "hobbies":     "Хобби",
     "greek_goal":   "Цель изучения", "exam_date": "Дата экзамена",
 }
+
+
+def _format_profile(profile: dict) -> str:
+    """Format profile data for display."""
+    def _v(key, default="—"):
+        val = profile.get(key)
+        if val is None:
+            return default
+        if isinstance(val, date):
+            return val.strftime("%d.%m.%Y")
+        return str(val)
+
+    return (
+        "👤 <b>Твой профиль</b>\n\n"
+        f"Имя: {h(_v('display_name'))}\n"
+        f"Возраст: {h(_v('age'))}\n"
+        f"Город: {h(_v('city'))}\n"
+        f"Родной язык: {h(_v('native_lang'))}\n"
+        f"Другие языки: {h(_v('other_langs'))}\n"
+        f"Работа/занятие: {h(_v('occupation'))}\n"
+        f"Семья: {h(_v('family_status'))}\n"
+        f"Хобби: {h(_v('hobbies'))}\n"
+        f"Цель изучения: {h(_v('greek_goal'))}\n"
+        f"Дата экзамена: {h(_v('exam_date'))}"
+    )
 
 
 async def settings_menu(message):
