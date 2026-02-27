@@ -1469,13 +1469,22 @@ async def settings_menu(message):
 
 # ─── Main ───────────────────────────────────────────────────────────────────────
 
+_conflict_count = 0
+
 async def conflict_error_handler(update, context):
-    """Suppress Conflict errors that appear briefly when a new deploy starts
-    while the previous container is still shutting down. python-telegram-bot
-    retries automatically; we just want a clean warning instead of a traceback."""
+    """Handle Conflict errors that appear when a new deploy starts while the
+    previous container is still shutting down.  Each call backs off a bit
+    longer (up to 30 s) so the two instances don't keep hammering each other
+    and the old one gets time to receive SIGTERM and exit cleanly."""
+    global _conflict_count
     if isinstance(context.error, Conflict):
-        print("[WARN] Conflict: another bot instance still running, will retry automatically.")
+        _conflict_count += 1
+        wait = min(5 * _conflict_count, 30)
+        print(f"[WARN] Conflict: another bot instance still running "
+              f"(attempt {_conflict_count}), backing off {wait}s …")
+        await asyncio.sleep(wait)
         return
+    _conflict_count = 0
     raise context.error
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1486,6 +1495,8 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app):
+    # Delete any stale webhook so polling can start without a Conflict right away.
+    await app.bot.delete_webhook(drop_pending_updates=True)
     await init_db()
     await app.bot.set_my_commands([
         BotCommand("start",    "Главное меню"),
@@ -1507,7 +1518,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_answer))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_error_handler(conflict_error_handler)
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, poll_interval=1)
 
 if __name__ == "__main__":
     main()
