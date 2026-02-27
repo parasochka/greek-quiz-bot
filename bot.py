@@ -13,7 +13,13 @@ import anthropic
 
 ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
-DATABASE_URL = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://", 1)
+_raw_db_url = os.environ.get("DATABASE_URL")
+if not _raw_db_url:
+    raise RuntimeError(
+        "DATABASE_URL environment variable is not set. "
+        "Please configure it in your deployment environment."
+    )
+DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1)
 
 db_pool = None
 
