@@ -52,6 +52,17 @@ def is_access_allowed(user) -> bool:
     return user.username in ALLOWED_USERNAMES
 
 
+def is_owner(user) -> bool:
+    return bool(user and user.username == OWNER_USERNAME)
+
+
+def get_main_menu_keyboard(user) -> list[list[InlineKeyboardButton]]:
+    keyboard = [row[:] for row in MAIN_MENU_KEYBOARD]
+    if is_owner(user):
+        keyboard.append([InlineKeyboardButton("🛠 Админка", callback_data="menu_admin")])
+    return keyboard
+
+
 def h(text):
     return html.escape(str(text))
 
@@ -454,6 +465,20 @@ async def save_result(user_id: int, answers: list):
 
 async def clear_history(user_id: int):
     return await _clear_all(user_id)
+
+
+async def _admin_list_users_with_quiz_counts():
+    async with _acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT u.telegram_id, u.username, u.first_name, COUNT(qs.id) AS quiz_count
+            FROM users u
+            LEFT JOIN quiz_sessions qs ON qs.user_id = u.telegram_id
+            GROUP BY u.telegram_id, u.username, u.first_name
+            ORDER BY quiz_count DESC, u.first_name NULLS LAST, u.username NULLS LAST
+            """
+        )
+    return rows
 
 
 # ─── Paused-session persistence (cross-device / bot-restart resume) ─────────────
@@ -1234,7 +1259,56 @@ async def _finish_onboarding(message, user_id, context):
         "✅ Отлично! Анкета заполнена.\n"
         "Теперь квизы будут персональными - вопросы из твоей жизни.\n\n"
         "Можно начинать!",
-        reply_markup=InlineKeyboardMarkup(MAIN_MENU_KEYBOARD),
+        reply_markup=InlineKeyboardMarkup(get_main_menu_keyboard(message.from_user)),
+    )
+
+
+async def send_about_message(message):
+    await message.reply_text(
+        "📖 <b>О боте</b>\n\n"
+        "Помогает учить современный греческий язык (уровень A2).\n\n"
+        "<b>Как работает:</b>\n"
+        "• Квизы из 20 вопросов - сколько хочешь в день\n"
+        "• Все вопросы генерирует AI на основе твоего профиля\n"
+        "• Первые 3 дня - режим обучения: бот охватывает все темы\n"
+        "• С 4-го дня - адаптивный режим: слабые темы чаще, сильные реже\n"
+        "• После каждого ответа - объяснение правила\n\n"
+        "<b>Команды:</b>\n"
+        "/start - главное меню\n"
+        "/quiz - начать квиз\n"
+        "/stats - статистика\n"
+        "/settings - настройки профиля\n"
+        "/about - о боте\n"
+        "/admin - админка\n\n"
+        "⚠️ Вопросы генерирует AI - возможны неточности.\n\n"
+        "Автор: @aparasochka",
+        parse_mode="HTML",
+    )
+
+
+async def show_admin_menu(message):
+    keyboard = [[InlineKeyboardButton("📈 Статистика пользователей", callback_data="admin_user_stats")]]
+    await message.reply_text("🛠 <b>Админка</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+
+
+async def show_admin_user_stats(message):
+    rows = await _admin_list_users_with_quiz_counts()
+    if not rows:
+        await message.reply_text("Пока нет пользователей.")
+        return
+
+    keyboard = []
+    for row in rows:
+        title = row["first_name"] or (f"@{row['username']}" if row["username"] else str(row["telegram_id"]))
+        username = f" (@{row['username']})" if row["username"] else ""
+        label = f"{title}{username} — {row['quiz_count']}"
+        keyboard.append([InlineKeyboardButton(label[:64], callback_data=f"admin_reset_{row['telegram_id']}")])
+
+    await message.reply_text(
+        "📈 <b>Статистика пользователей</b>\n"
+        "Нажми на пользователя, чтобы полностью сбросить его память (квизы/статистику).",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
     )
 
 
@@ -1248,7 +1322,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _is_onboarding_complete(update.effective_user.id):
         await update.message.reply_text(
             "📋 Главное меню:",
-            reply_markup=InlineKeyboardMarkup(MAIN_MENU_KEYBOARD),
+            reply_markup=InlineKeyboardMarkup(get_main_menu_keyboard(update.effective_user)),
         )
     else:
         keyboard = [[InlineKeyboardButton("📋 Заполнить анкету", callback_data="start_onboarding")]]
@@ -1265,7 +1339,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "📋 Главное меню:",
-        reply_markup=InlineKeyboardMarkup(MAIN_MENU_KEYBOARD),
+        reply_markup=InlineKeyboardMarkup(get_main_menu_keyboard(update.effective_user)),
     )
 
 async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1306,24 +1380,13 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await settings_menu(query.message)
 
     elif query.data == "menu_about":
-        await query.message.reply_text(
-            "📖 <b>О боте</b>\n\n"
-            "Помогает учить современный греческий язык (уровень A2).\n\n"
-            "<b>Как работает:</b>\n"
-            "• Квизы из 20 вопросов - сколько хочешь в день\n"
-            "• Все вопросы генерирует AI на основе твоего профиля\n"
-            "• Первые 3 дня - режим обучения: бот охватывает все темы\n"
-            "• С 4-го дня - адаптивный режим: слабые темы чаще, сильные реже\n"
-            "• После каждого ответа - объяснение правила\n\n"
-            "<b>Команды:</b>\n"
-            "/quiz - начать квиз\n"
-            "/stats - статистика\n"
-            "/settings - настройки профиля\n"
-            "/menu - главное меню\n\n"
-            "⚠️ Вопросы генерирует AI - возможны неточности.\n\n"
-            "Автор: @aparasochka",
-            parse_mode="HTML",
-        )
+        await send_about_message(query.message)
+
+    elif query.data == "menu_admin":
+        if not is_owner(query.from_user):
+            await query.message.reply_text("⛔ Доступ запрещён.")
+            return
+        await show_admin_menu(query.message)
 
 async def start_quiz(message, user_id):
     # Restore a paused session if one exists (survives bot restarts and device switches).
@@ -1630,8 +1693,41 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await query.message.reply_text(
             "📋 Главное меню:",
-            reply_markup=InlineKeyboardMarkup(MAIN_MENU_KEYBOARD),
+            reply_markup=InlineKeyboardMarkup(get_main_menu_keyboard(query.from_user)),
         )
+        return
+
+    if data == "admin_user_stats":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not is_owner(query.from_user):
+            await query.message.reply_text("⛔ Доступ запрещён.")
+            return
+        await show_admin_user_stats(query.message)
+        return
+
+    if data.startswith("admin_reset_"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not is_owner(query.from_user):
+            await query.message.reply_text("⛔ Доступ запрещён.")
+            return
+        try:
+            target_user_id = int(data.split("_")[-1])
+        except ValueError:
+            await query.message.reply_text("Некорректный идентификатор пользователя.")
+            return
+
+        count = await clear_history(target_user_id)
+        user_sessions.pop(target_user_id, None)
+        await query.message.reply_text(
+            f"🧹 Память пользователя {target_user_id} очищена. Удалено ответов: {count}."
+        )
+        await show_admin_user_stats(query.message)
         return
 
     # ── Reset stats (from settings menu) ──
@@ -2150,6 +2246,20 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await settings_menu(update.message)
 
 
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_access_allowed(update.effective_user):
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+    await send_about_message(update.message)
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_access_allowed(update.effective_user) or not is_owner(update.effective_user):
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+    await show_admin_menu(update.message)
+
+
 async def daily_quiz_reminder(app):
     """Background task: at 18:00 Athens time send quiz reminder to users who haven't played today."""
     athens_tz = ZoneInfo("Europe/Athens")
@@ -2199,16 +2309,19 @@ async def post_init(app):
         BotCommand("quiz",     "Начать квиз"),
         BotCommand("stats",    "Моя статистика"),
         BotCommand("settings", "Настройки профиля"),
-        BotCommand("menu",     "Главное меню"),
+        BotCommand("about",    "О боте"),
+        BotCommand("admin",    "Админка"),
     ])
 
 def main():
     app = Application.builder().token(TG_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start",    start))
-    app.add_handler(CommandHandler("menu",     menu))
     app.add_handler(CommandHandler("quiz",     quiz_command))
     app.add_handler(CommandHandler("stats",    stats_command))
     app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("about",    about_command))
+    app.add_handler(CommandHandler("admin",    admin_command))
+    app.add_handler(CommandHandler("menu",     menu))
     app.add_handler(CommandHandler("reset",    reset_command))
     app.add_handler(CallbackQueryHandler(handle_answer))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
