@@ -837,15 +837,16 @@ def _generate_questions_claude(stats, session_dates, profile):
     return _parse_questions(raw, "Claude")
 
 
-def _generate_questions_openai(stats, session_dates, profile):
+async def _generate_questions_openai(stats, session_dates, profile):
     import time
+    from openai import AsyncOpenAI
     t0 = time.monotonic()
-    print(f"[openai] creating client …", flush=True)
-    client = OpenAI(api_key=OPENAI_KEY, timeout=90.0)
+    print(f"[openai] creating async client …", flush=True)
+    client = AsyncOpenAI(api_key=OPENAI_KEY, timeout=60.0)
     system_prompt = build_system_prompt(profile or {})
     dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
     print(f"[openai] sending request to gpt-5-mini (prompt ~{len(dynamic_prompt)} chars) …", flush=True)
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model="gpt-5-mini",
         max_completion_tokens=8000,
         messages=[
@@ -870,10 +871,11 @@ def _generate_questions_openai(stats, session_dates, profile):
     return _parse_questions(raw, "GPT-5 mini")
 
 
-def generate_questions(stats, session_dates, profile):
+async def generate_questions(stats, session_dates, profile):
     if MODEL_PROVIDER == "openai":
-        return _generate_questions_openai(stats, session_dates, profile)
-    return _generate_questions_claude(stats, session_dates, profile)
+        return await _generate_questions_openai(stats, session_dates, profile)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _generate_questions_claude, stats, session_dates, profile)
 
 # ─── Session storage ───────────────────────────────────────────────────────────
 
@@ -1034,6 +1036,7 @@ async def start_quiz(message, user_id):
 async def _start_new_quiz(message, user_id):
     """Generate fresh questions and start a new quiz, discarding any paused state."""
     import time
+    import traceback
     msg = await message.reply_text("⏳ Готовлю квиз... Это займёт около минуты.")
     try:
         t_start = time.monotonic()
@@ -1042,29 +1045,12 @@ async def _start_new_quiz(message, user_id):
         profile = await _load_profile(user_id) or {}
         print(f"[quiz] user={user_id} data loaded in {time.monotonic()-t_start:.1f}s, generating questions …", flush=True)
 
-        loop = asyncio.get_running_loop()
-        last_exc = None
-        questions = None
-        for attempt in range(3):
-            try:
-                print(f"[quiz] user={user_id} attempt {attempt+1}/3 calling generate_questions …", flush=True)
-                t_gen = time.monotonic()
-                questions = await asyncio.wait_for(
-                    loop.run_in_executor(None, generate_questions, stats, session_dates, profile),
-                    timeout=120.0,
-                )
-                print(f"[quiz] user={user_id} questions generated in {time.monotonic()-t_gen:.1f}s", flush=True)
-                break
-            except asyncio.TimeoutError:
-                last_exc = TimeoutError(f"generate_questions timed out on attempt {attempt+1}")
-                print(f"[quiz] user={user_id} TIMEOUT on attempt {attempt+1}", flush=True)
-            except Exception as exc:
-                last_exc = exc
-                print(f"[quiz] user={user_id} ERROR on attempt {attempt+1}: {type(exc).__name__}: {exc}", flush=True)
-            if attempt < 2:
-                await asyncio.sleep(2 ** attempt)  # 1s, 2s
-        if questions is None:
-            raise last_exc
+        t_gen = time.monotonic()
+        questions = await asyncio.wait_for(
+            generate_questions(stats, session_dates, profile),
+            timeout=90.0,
+        )
+        print(f"[quiz] user={user_id} questions generated in {time.monotonic()-t_gen:.1f}s", flush=True)
 
         session = {
             "questions": questions,
@@ -1077,8 +1063,19 @@ async def _start_new_quiz(message, user_id):
         await _save_paused_session(user_id, session)
         await msg.delete()
         await send_question(message, user_id)
+    except asyncio.TimeoutError:
+        print(f"[quiz] user={user_id} TIMEOUT: OpenAI did not respond in 90s", flush=True)
+        try:
+            await msg.edit_text("❌ OpenAI не ответил за 90 секунд.\n\nПопробуй ещё раз через /quiz")
+        except Exception:
+            pass
     except Exception as e:
-        await msg.edit_text(f"❌ Не удалось загрузить квиз: {e}\n\nПопробуй ещё раз через /quiz")
+        print(f"[quiz] user={user_id} ERROR: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        try:
+            await msg.edit_text(f"❌ Ошибка: {type(e).__name__}: {e}\n\nПопробуй ещё раз через /quiz")
+        except Exception:
+            pass
 
 async def send_question(message, user_id):
     session = user_sessions[user_id]
