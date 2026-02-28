@@ -27,6 +27,9 @@ DATABASE_URL = _require_env("DATABASE_URL").replace("postgres://", "postgresql:/
 
 # The bot now uses only ChatGPT API for quiz generation.
 OPENAI_KEY = _require_env("OPENAI_API_KEY")
+OPENAI_REQUEST_TIMEOUT_SEC = float(os.environ.get("OPENAI_REQUEST_TIMEOUT_SEC", "45"))
+QUIZ_GENERATION_TIMEOUT_SEC = float(os.environ.get("QUIZ_GENERATION_TIMEOUT_SEC", "120"))
+OPENAI_MAX_ATTEMPTS = int(os.environ.get("OPENAI_MAX_ATTEMPTS", "3"))
 
 # How long a paused (in-progress) quiz session is kept in the DB before expiry.
 # Configurable via env var PAUSED_SESSION_TTL_HOURS (default: 24 hours).
@@ -655,6 +658,9 @@ PROMPT_STATIC = """КРИТИЧЕСКИ ВАЖНО:
 Варианты ответа должны быть перемешаны случайным образом — correctIndex указывает реальную позицию правильного варианта.
 Неправильные варианты — правдоподобные: похожие формы, близкие слова, частые ошибки.
 ОБЯЗАТЕЛЬНО: все 4 варианта в каждом вопросе должны быть разными строками — никаких повторений внутри одного вопроса.
+ЖЁСТКОЕ ПРАВИЛО: запрещены варианты-двойники, которые отличаются только точкой, запятой, лишним пробелом или регистром. Если ты сомневаешься — перепиши дистрактор полностью.
+ПЛОХО: ["иду домой", "иду домой.", "Иду домой", "иду  домой"] — это повторы.
+ХОРОШО: каждый вариант несёт разный смысл или разную грамматическую форму.
 
 СТРУКТУРА JSON НЕИЗМЕННА — независимо от содержания вопросов:
 • Ровно 20 объектов в массиве — не меньше, не больше.
@@ -870,10 +876,10 @@ def _parse_questions(raw: str, provider_name: str) -> list:
 
 async def _generate_questions_openai(stats, session_dates, profile):
     import time
-    client = AsyncOpenAI(api_key=OPENAI_KEY, timeout=55.0)
+    client = AsyncOpenAI(api_key=OPENAI_KEY, timeout=OPENAI_REQUEST_TIMEOUT_SEC)
     system_prompt = build_system_prompt(profile or {})
     dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
-    max_attempts = 3
+    max_attempts = OPENAI_MAX_ATTEMPTS
     retry_hint = ""
     last_error = None
 
@@ -913,6 +919,7 @@ async def _generate_questions_openai(stats, session_dates, profile):
                                             "type": "array",
                                             "minItems": 4,
                                             "maxItems": 4,
+                                            "uniqueItems": True,
                                             "items": {"type": "string"},
                                         },
                                         "correctIndex": {"type": "integer", "minimum": 0, "maximum": 3},
@@ -1146,7 +1153,7 @@ async def _start_new_quiz(message, user_id):
         t_gen = time.monotonic()
         questions = await asyncio.wait_for(
             generate_questions(stats, session_dates, profile),
-            timeout=60.0,
+            timeout=QUIZ_GENERATION_TIMEOUT_SEC,
         )
         print(f"[quiz] user={user_id} questions generated in {time.monotonic()-t_gen:.1f}s", flush=True)
 
@@ -1162,9 +1169,12 @@ async def _start_new_quiz(message, user_id):
         await msg.delete()
         await send_question(message, user_id)
     except asyncio.TimeoutError:
-        print(f"[quiz] user={user_id} TIMEOUT: OpenAI did not respond in 60s", flush=True)
+        print(f"[quiz] user={user_id} TIMEOUT: OpenAI did not respond in {QUIZ_GENERATION_TIMEOUT_SEC:.0f}s", flush=True)
         try:
-            await msg.edit_text("❌ OpenAI не ответил за 60 секунд.\n\nПопробуй ещё раз через /quiz")
+            await msg.edit_text(
+                f"❌ OpenAI не ответил за {QUIZ_GENERATION_TIMEOUT_SEC:.0f} секунд.\n\n"
+                "Попробуй ещё раз через /quiz"
+            )
         except Exception:
             pass
     except Exception as e:
