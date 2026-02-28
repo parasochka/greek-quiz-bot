@@ -11,7 +11,7 @@ from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
-from telegram.error import Conflict
+from telegram.error import BadRequest, Conflict
 from openai import AsyncOpenAI
 
 def _require_env(name: str) -> str:
@@ -1906,7 +1906,13 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💡 {h(q['explanation'])}"
         )
 
-    await query.edit_message_reply_markup(reply_markup=None)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except BadRequest as e:
+        # Duplicate callback deliveries can race and try to remove an already-removed keyboard.
+        # Telegram returns "Message is not modified" in this case; ignore and continue.
+        if "Message is not modified" not in str(e):
+            raise
     await query.message.reply_text(result, parse_mode="HTML")
 
     session["current"] += 1
