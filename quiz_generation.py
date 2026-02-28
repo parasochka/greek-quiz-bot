@@ -16,6 +16,12 @@ from config import (
 )
 from topics import MASTER_TOPICS, normalize_topic
 
+
+def days_since_last_session(session_dates):
+    if not session_dates:
+        return 99
+    return (date.today() - date.fromisoformat(session_dates[-1])).days
+
 PROMPT_STATIC = """КРИТИЧЕСКИ ВАЖНО:
 - Только стандартный современный греческий язык (νέα ελληνική γλώσσα).
 - Никакого кипрского диалекта, кипрских слов, кипрского произношения.

@@ -643,11 +643,6 @@ def calc_streak(session_dates):
     current = cur if diff <= 1 else 0
     return current, best
 
-def days_since_last_session(session_dates):
-    if not session_dates:
-        return 99
-    return (date.today() - date.fromisoformat(session_dates[-1])).days
-
 def type_stats_all(history):
     """Per question-type accuracy from full history (used only in /stats display)."""
     stats = {}
