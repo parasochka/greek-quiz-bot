@@ -443,7 +443,7 @@ async def _save_all(user_id: int, answers: list):
 
 async def _clear_all(user_id: int):
     """
-    Wipe answers, quiz_sessions, topic_stats, and any paused session for this user.
+    Wipe every per-user statistics table while keeping user account/profile info.
     Returns number of answers deleted.
     """
     async with _acquire() as conn:
@@ -451,11 +451,27 @@ async def _clear_all(user_id: int):
             count = await conn.fetchval(
                 "SELECT COUNT(*) FROM answers WHERE user_id=$1", user_id,
             )
-            await conn.execute("DELETE FROM answers WHERE user_id=$1", user_id)
-            await conn.execute("DELETE FROM quiz_sessions WHERE user_id=$1", user_id)
-            await conn.execute("DELETE FROM topic_stats WHERE user_id=$1", user_id)
-            await conn.execute("DELETE FROM topic_memory WHERE user_id=$1", user_id)
-            await conn.execute("DELETE FROM paused_sessions WHERE user_id=$1", user_id)
+
+            # Preserve profile/account info and clear every other table that stores
+            # rows by user_id. This keeps admin reset future-proof when new
+            # statistics tables are added.
+            tables = await conn.fetch(
+                """
+                SELECT table_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND column_name = 'user_id'
+                  AND table_name NOT IN ('users', 'user_profiles')
+                ORDER BY table_name
+                """
+            )
+            for row in tables:
+                table_name = row["table_name"]
+                safe_name = table_name.replace('"', '""')
+                await conn.execute(
+                    f'DELETE FROM "{safe_name}" WHERE user_id=$1',
+                    user_id,
+                )
             return count
 
 
@@ -1708,7 +1724,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_admin_user_stats(query.message)
         return
 
-    if data.startswith("admin_reset_"):
+    if data.startswith("admin_reset_confirm_"):
         try:
             await query.answer()
         except Exception:
@@ -1725,9 +1741,42 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = await clear_history(target_user_id)
         user_sessions.pop(target_user_id, None)
         await query.message.reply_text(
-            f"🧹 Память пользователя {target_user_id} очищена. Удалено ответов: {count}."
+            f"🧹 Статистика пользователя {target_user_id} полностью очищена. "
+            f"Удалено ответов: {count}."
         )
         await show_admin_user_stats(query.message)
+        return
+
+    if data.startswith("admin_reset_"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not is_owner(query.from_user):
+            await query.message.reply_text("⛔ Доступ запрещён.")
+            return
+        try:
+            target_user_id = int(data.split("_")[-1])
+        except ValueError:
+            await query.message.reply_text("Некорректный идентификатор пользователя.")
+            return
+
+        keyboard = [[
+            InlineKeyboardButton(
+                "🗑 Да, очистить полностью",
+                callback_data=f"admin_reset_confirm_{target_user_id}",
+            ),
+            InlineKeyboardButton("❌ Отмена", callback_data="admin_user_stats"),
+        ]]
+        await query.message.reply_text(
+            "⚠️ <b>Подтверждение очистки статистики</b>\n\n"
+            f"Пользователь: <code>{target_user_id}</code>\n"
+            "Будет удалена вся учебная статистика (квизы, ответы, память, паузы и др.), "
+            "но данные профиля и аккаунта останутся.\n\n"
+            "Продолжить?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
         return
 
     # ── Reset stats (from settings menu) ──
