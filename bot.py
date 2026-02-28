@@ -842,7 +842,7 @@ def _generate_questions_openai(stats, session_dates, profile):
     system_prompt = build_system_prompt(profile or {})
     dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
     response = client.chat.completions.create(
-        model="gpt-5-mini",
+        model="gpt-4o-mini",
         max_completion_tokens=4000,
         messages=[
             {"role": "system", "content": system_prompt},
@@ -850,7 +850,7 @@ def _generate_questions_openai(stats, session_dates, profile):
         ],
     )
     raw = response.choices[0].message.content.strip()
-    return _parse_questions(raw, "GPT-5 mini")
+    return _parse_questions(raw, "gpt-4o-mini")
 
 
 def generate_questions(stats, session_dates, profile):
