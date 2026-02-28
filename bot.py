@@ -38,6 +38,7 @@ OPENAI_TEMPERATURE = float(os.environ.get("OPENAI_TEMPERATURE", "0.55"))
 PAUSED_SESSION_TTL_HOURS = int(os.environ.get("PAUSED_SESSION_TTL_HOURS", "24"))
 
 db_pool = None
+QUIZ_QUESTION_COUNT = 20
 
 
 @contextlib.asynccontextmanager
@@ -230,6 +231,19 @@ async def init_db():
                 expires_at    TIMESTAMPTZ NOT NULL
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS topic_memory (
+                user_id      BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                topic        VARCHAR(100) NOT NULL,
+                mastery      DOUBLE PRECISION NOT NULL DEFAULT 0.25,
+                stability    DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                due_at       DATE NOT NULL DEFAULT CURRENT_DATE,
+                last_seen    DATE,
+                review_count INT NOT NULL DEFAULT 0,
+                lapses       INT NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, topic)
+            )
+        """)
 
 
 async def register_user(user):
@@ -386,6 +400,160 @@ async def _load_compact_data(user_id: int):
     return stats, session_dates
 
 
+async def _load_topic_memory(user_id: int) -> dict:
+    """Load per-topic spaced-repetition state."""
+    async with _acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT topic, mastery, stability, due_at, last_seen, review_count, lapses "
+            "FROM topic_memory WHERE user_id=$1",
+            user_id,
+        )
+    return {
+        r["topic"]: {
+            "mastery": float(r["mastery"]),
+            "stability": float(r["stability"]),
+            "due_at": str(r["due_at"]) if r["due_at"] else None,
+            "last_seen": str(r["last_seen"]) if r["last_seen"] else None,
+            "review_count": int(r["review_count"]),
+            "lapses": int(r["lapses"]),
+        }
+        for r in rows
+    }
+
+
+def build_topic_sequence(stats: dict, session_dates: list, topic_memory: dict, total_questions: int = QUIZ_QUESTION_COUNT) -> list[str]:
+    """Server-side topic scheduler for spaced repetition (returns exact per-slot topics)."""
+    today = date.today()
+    learning_mode = len(session_dates) < 3
+
+    def acc(topic: str) -> float:
+        s = stats.get(topic, {"correct": 0, "total": 0})
+        return (s["correct"] / s["total"]) if s.get("total") else 0.0
+
+    def overdue_days(topic: str) -> int:
+        mem = topic_memory.get(topic) or {}
+        due_s = mem.get("due_at")
+        if not due_s:
+            return 0
+        try:
+            due = date.fromisoformat(due_s)
+        except ValueError:
+            return 0
+        return max((today - due).days, 0)
+
+    def last_seen_days(topic: str) -> int:
+        mem = topic_memory.get(topic) or {}
+        last_s = mem.get("last_seen")
+        if not last_s:
+            s = stats.get(topic, {})
+            last_s = s.get("last_seen")
+        if not last_s:
+            return 999
+        try:
+            last = date.fromisoformat(last_s)
+        except ValueError:
+            return 999
+        return (today - last).days
+
+    seen_topics = {t for t, s in stats.items() if s.get("total", 0) > 0}
+    unseen_topics = [t for t in MASTER_TOPICS if t not in seen_topics]
+    weak_topics = [t for t in MASTER_TOPICS if t in seen_topics and acc(t) < 0.60]
+    medium_topics = [t for t in MASTER_TOPICS if t in seen_topics and 0.60 <= acc(t) < 0.85]
+    strong_topics = [t for t in MASTER_TOPICS if t in seen_topics and acc(t) >= 0.85]
+
+    def sort_pool(pool: list[str], weakest_first: bool) -> list[str]:
+        return sorted(
+            pool,
+            key=lambda t: (
+                -overdue_days(t),
+                acc(t) if weakest_first else -acc(t),
+                -last_seen_days(t),
+            ),
+        )
+
+    sequence = []
+
+    def fill_from_pool(pool: list[str], n: int, weakest_first: bool = True):
+        if n <= 0 or not pool:
+            return
+        ordered = sort_pool(pool, weakest_first=weakest_first)
+        i = 0
+        while len(sequence) < total_questions and n > 0 and ordered:
+            sequence.append(ordered[i % len(ordered)])
+            i += 1
+            n -= 1
+
+    if learning_mode:
+        fill_from_pool(unseen_topics, min(5, total_questions), weakest_first=True)
+        fill_from_pool([t for t in MASTER_TOPICS if t not in unseen_topics],
+                       total_questions - len(sequence), weakest_first=True)
+    else:
+        quotas = {
+            "weak": round(total_questions * 0.35),
+            "medium": round(total_questions * 0.25),
+            "strong": round(total_questions * 0.10),
+            "unseen": total_questions - round(total_questions * 0.35) - round(total_questions * 0.25) - round(total_questions * 0.10),
+        }
+        fill_from_pool(weak_topics, quotas["weak"], weakest_first=True)
+        fill_from_pool(medium_topics, quotas["medium"], weakest_first=True)
+        fill_from_pool(strong_topics, quotas["strong"], weakest_first=False)
+        fill_from_pool(unseen_topics, quotas["unseen"], weakest_first=True)
+
+        if len(sequence) < total_questions:
+            fill_from_pool(MASTER_TOPICS, total_questions - len(sequence), weakest_first=True)
+
+    if len(sequence) < total_questions:
+        fill_from_pool(MASTER_TOPICS, total_questions - len(sequence), weakest_first=True)
+
+    random.shuffle(sequence)
+    return sequence[:total_questions]
+
+
+async def _update_topic_memory_for_answer(conn, user_id: int, topic: str, correct: bool) -> None:
+    """Update spaced-repetition state for one topic attempt."""
+    row = await conn.fetchrow(
+        "SELECT mastery, stability, review_count, lapses FROM topic_memory "
+        "WHERE user_id=$1 AND topic=$2",
+        user_id, topic,
+    )
+    if row:
+        mastery = float(row["mastery"])
+        stability = float(row["stability"])
+        review_count = int(row["review_count"])
+        lapses = int(row["lapses"])
+    else:
+        mastery = 0.25
+        stability = 1.0
+        review_count = 0
+        lapses = 0
+
+    if correct:
+        mastery = min(1.0, mastery + 0.08)
+        stability = min(45.0, max(1.0, stability * 1.4))
+    else:
+        mastery = max(0.0, mastery - 0.12)
+        stability = max(1.0, stability * 0.6)
+        lapses += 1
+
+    review_count += 1
+    due_at = date.today() + timedelta(days=max(1, round(stability)))
+
+    await conn.execute(
+        """
+        INSERT INTO topic_memory (user_id, topic, mastery, stability, due_at, last_seen, review_count, lapses)
+        VALUES ($1, $2, $3, $4, $5, CURRENT_DATE, $6, $7)
+        ON CONFLICT (user_id, topic) DO UPDATE SET
+            mastery = EXCLUDED.mastery,
+            stability = EXCLUDED.stability,
+            due_at = EXCLUDED.due_at,
+            last_seen = CURRENT_DATE,
+            review_count = EXCLUDED.review_count,
+            lapses = EXCLUDED.lapses
+        """,
+        user_id, topic, mastery, stability, due_at, review_count, lapses,
+    )
+
+
 async def _load_history_for_stats(user_id: int):
     """Load full answers only for /stats display (infrequent). Not used on quiz start."""
     try:
@@ -433,6 +601,9 @@ async def _save_all(user_id: int, answers: list):
                     upsert_sql,
                     user_id, a["topic"], 1 if a["correct"] else 0,
                 )
+                await _update_topic_memory_for_answer(
+                    conn, user_id, a["topic"], a["correct"],
+                )
 
 
 async def _clear_all(user_id: int):
@@ -448,6 +619,7 @@ async def _clear_all(user_id: int):
             await conn.execute("DELETE FROM answers WHERE user_id=$1", user_id)
             await conn.execute("DELETE FROM quiz_sessions WHERE user_id=$1", user_id)
             await conn.execute("DELETE FROM topic_stats WHERE user_id=$1", user_id)
+            await conn.execute("DELETE FROM topic_memory WHERE user_id=$1", user_id)
             await conn.execute("DELETE FROM paused_sessions WHERE user_id=$1", user_id)
             return count
 
@@ -733,7 +905,7 @@ def build_system_prompt(profile: dict) -> str:
     )
 
 
-def build_dynamic_prompt(stats, session_dates, profile):
+def build_dynamic_prompt(stats, session_dates, profile, required_topics=None):
     """
     Returns only the dynamic part of the prompt — per-session stats + conditional notes.
 
@@ -816,6 +988,15 @@ def build_dynamic_prompt(stats, session_dates, profile):
         "фокус на практические ситуации из повседневной рутины",
     ])
 
+    topic_plan_block = ""
+    if required_topics:
+        numbered = "\n".join(f"  {i+1}. {topic}" for i, topic in enumerate(required_topics))
+        topic_plan_block = (
+            "\n\nСЕРВЕРНЫЙ ПЛАН ТЕМ (ОБЯЗАТЕЛЬНО):\n"
+            "Для вопроса i (от 1 до 20) поле topic должно быть РОВНО как в строке i ниже.\n"
+            f"{numbered}\n"
+        )
+
     return (
         f"{exam_line}"
         f"{learning_note}"
@@ -824,6 +1005,7 @@ def build_dynamic_prompt(stats, session_dates, profile):
         f"Вариативный фокус этого квиза: {variety_hint}. Используй его как стиль, не нарушая приоритет тем.\n"
         f"Статистика ученика по темам (накопленная за всё время):\n"
         f"{hist_summary}"
+        f"{topic_plan_block}"
     )
 
 
@@ -893,6 +1075,22 @@ def _collect_question_errors(questions: list) -> dict:
 
     return errors
 
+
+
+
+def _collect_topic_plan_errors(questions: list, required_topics: list[str] | None) -> dict:
+    """Return {index: reason} when question topic does not match server-side required slot."""
+    if not required_topics:
+        return {}
+    errors = {}
+    for i, q in enumerate(questions):
+        if i >= len(required_topics):
+            break
+        expected = required_topics[i]
+        actual = q.get("topic") if isinstance(q, dict) else None
+        if actual != expected:
+            errors[i] = f"topic должен быть '{expected}', получено '{actual}'"
+    return errors
 
 def _finalize_questions(questions: list) -> list:
     """Normalize topics, enforce validity and shuffle options server-side."""
@@ -984,11 +1182,11 @@ async def _repair_questions_openai(client, system_prompt: str, questions: list, 
     return _extract_questions(raw, "gpt-4.1-mini repair", expected_count=n)
 
 
-async def _generate_questions_openai(stats, session_dates, profile):
+async def _generate_questions_openai(stats, session_dates, profile, required_topics=None):
     import time
     client = AsyncOpenAI(api_key=OPENAI_KEY, timeout=OPENAI_REQUEST_TIMEOUT_SEC)
     system_prompt = build_system_prompt(profile or {})
-    dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
+    dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {}, required_topics=required_topics)
     max_attempts = OPENAI_MAX_ATTEMPTS
     retry_hint = ""
     last_error = None
@@ -1074,6 +1272,20 @@ async def _generate_questions_openai(stats, session_dates, profile):
                     for repl, idx in zip(repaired, sorted(errors)):
                         parsed[idx] = repl
 
+                topic_plan_errors = _collect_topic_plan_errors(parsed, required_topics)
+                for repair_round in range(1, 3):
+                    if not topic_plan_errors:
+                        break
+                    print(
+                        f"[openai] enforcing server topic plan, repair round {repair_round}: {len(topic_plan_errors)} slot(s)",
+                        flush=True,
+                    )
+                    repaired = await _repair_questions_openai(client, system_prompt, parsed, topic_plan_errors)
+                    for repl, idx in zip(repaired, sorted(topic_plan_errors)):
+                        repl["topic"] = required_topics[idx]
+                        parsed[idx] = repl
+                    topic_plan_errors = _collect_topic_plan_errors(parsed, required_topics)
+
                 parsed = _finalize_questions(parsed)
                 print(f"[openai] parsed response ok ({len(raw)} chars)", flush=True)
                 return parsed
@@ -1091,8 +1303,8 @@ async def _generate_questions_openai(stats, session_dates, profile):
     raise ValueError(f"Не удалось сгенерировать валидный квиз за {max_attempts} попытки. Последняя ошибка: {last_error}")
 
 
-async def generate_questions(stats, session_dates, profile):
-    return await _generate_questions_openai(stats, session_dates, profile)
+async def generate_questions(stats, session_dates, profile, required_topics=None):
+    return await _generate_questions_openai(stats, session_dates, profile, required_topics=required_topics)
 
 # ─── Session storage ───────────────────────────────────────────────────────────
 
@@ -1271,12 +1483,14 @@ async def _start_new_quiz(message, user_id):
         t_start = time.monotonic()
         print(f"[quiz] user={user_id} loading data …", flush=True)
         stats, session_dates = await _load_compact_data(user_id)
+        topic_memory = await _load_topic_memory(user_id)
         profile = await _load_profile(user_id) or {}
+        required_topics = build_topic_sequence(stats, session_dates, topic_memory, total_questions=QUIZ_QUESTION_COUNT)
         print(f"[quiz] user={user_id} data loaded in {time.monotonic()-t_start:.1f}s, generating questions …", flush=True)
 
         t_gen = time.monotonic()
         questions = await asyncio.wait_for(
-            generate_questions(stats, session_dates, profile),
+            generate_questions(stats, session_dates, profile, required_topics=required_topics),
             timeout=QUIZ_GENERATION_TIMEOUT_SEC,
         )
         print(f"[quiz] user={user_id} questions generated in {time.monotonic()-t_gen:.1f}s", flush=True)
