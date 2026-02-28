@@ -837,15 +837,16 @@ def _generate_questions_claude(stats, session_dates, profile):
     return _parse_questions(raw, "Claude")
 
 
-def _generate_questions_openai(stats, session_dates, profile):
+async def _generate_questions_openai(stats, session_dates, profile):
     import time
+    from openai import AsyncOpenAI
     t0 = time.monotonic()
-    print(f"[openai] creating client …", flush=True)
-    client = OpenAI(api_key=OPENAI_KEY, timeout=90.0)
+    print(f"[openai] creating async client …", flush=True)
+    client = AsyncOpenAI(api_key=OPENAI_KEY, timeout=60.0)
     system_prompt = build_system_prompt(profile or {})
     dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
     print(f"[openai] sending request to gpt-5-mini (prompt ~{len(dynamic_prompt)} chars) …", flush=True)
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model="gpt-5-mini",
         max_completion_tokens=8000,
         messages=[
@@ -870,10 +871,11 @@ def _generate_questions_openai(stats, session_dates, profile):
     return _parse_questions(raw, "GPT-5 mini")
 
 
-def generate_questions(stats, session_dates, profile):
+async def generate_questions(stats, session_dates, profile):
     if MODEL_PROVIDER == "openai":
-        return _generate_questions_openai(stats, session_dates, profile)
-    return _generate_questions_claude(stats, session_dates, profile)
+        return await _generate_questions_openai(stats, session_dates, profile)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _generate_questions_claude, stats, session_dates, profile)
 
 # ─── Session storage ───────────────────────────────────────────────────────────
 
@@ -1042,7 +1044,6 @@ async def _start_new_quiz(message, user_id):
         profile = await _load_profile(user_id) or {}
         print(f"[quiz] user={user_id} data loaded in {time.monotonic()-t_start:.1f}s, generating questions …", flush=True)
 
-        loop = asyncio.get_running_loop()
         last_exc = None
         questions = None
         for attempt in range(3):
@@ -1050,7 +1051,7 @@ async def _start_new_quiz(message, user_id):
                 print(f"[quiz] user={user_id} attempt {attempt+1}/3 calling generate_questions …", flush=True)
                 t_gen = time.monotonic()
                 questions = await asyncio.wait_for(
-                    loop.run_in_executor(None, generate_questions, stats, session_dates, profile),
+                    generate_questions(stats, session_dates, profile),
                     timeout=120.0,
                 )
                 print(f"[quiz] user={user_id} questions generated in {time.monotonic()-t_gen:.1f}s", flush=True)
