@@ -1,5 +1,4 @@
 import os
-from telegram import InlineKeyboardButton
 
 
 def require_env(name: str) -> str:
@@ -62,9 +61,3 @@ WELCOME_TEXT = (
     "Чтобы начать, расскажи немного о себе - займёт 2 минуты."
 )
 
-MAIN_MENU_KEYBOARD = [
-    [InlineKeyboardButton("🎯 Начать квиз", callback_data="menu_quiz")],
-    [InlineKeyboardButton("📊 Моя статистика", callback_data="menu_stats")],
-    [InlineKeyboardButton("⚙️ Настройки", callback_data="menu_settings")],
-    [InlineKeyboardButton("ℹ️ О Greekly", callback_data="menu_about")],
-]

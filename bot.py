@@ -18,7 +18,6 @@ from config import (
     ALLOWED_USERNAMES,
     DATABASE_URL,
     LETTERS,
-    MAIN_MENU_KEYBOARD,
     ONBOARDING_STEPS,
     OWNER_USERNAME,
     PAUSED_SESSION_TTL_HOURS,
@@ -29,6 +28,14 @@ from config import (
     TG_TOKEN,
     WELCOME_TEXT,
 )
+
+MAIN_MENU_KEYBOARD = [
+    [InlineKeyboardButton("🎯 Начать квиз", callback_data="menu_quiz")],
+    [InlineKeyboardButton("📊 Моя статистика", callback_data="menu_stats")],
+    [InlineKeyboardButton("⚙️ Настройки", callback_data="menu_settings")],
+    [InlineKeyboardButton("ℹ️ О Greekly", callback_data="menu_about")],
+]
+
 from topics import MASTER_TOPICS, build_topic_sequence
 from quiz_generation import TYPE_LABELS, TYPE_NAMES_RU, generate_questions
 

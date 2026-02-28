@@ -438,14 +438,16 @@ def _collect_topic_plan_errors(questions: list, required_topics: list[str] | Non
 
 def _finalize_questions(questions: list) -> list:
     """Normalize topics, enforce validity and shuffle options server-side."""
+    # Normalise topic names FIRST — guard against mixed Greek/Cyrillic characters
+    # so that fuzzy-matched topics pass the MASTER_TOPICS membership check below.
+    for q in questions:
+        if isinstance(q, dict) and isinstance(q.get("topic"), str):
+            q["topic"] = normalize_topic(q["topic"])
+
     errors = _collect_question_errors(questions)
     if errors:
         first_i = min(errors)
         raise ValueError(f"Question {first_i}: {errors[first_i]}")
-
-    # Normalise topic names — guard against mixed Greek/Cyrillic characters
-    for q in questions:
-        q["topic"] = normalize_topic(q["topic"])
 
     # Server-side shuffle — correct answer is never stuck at position 0
     for q in questions:
