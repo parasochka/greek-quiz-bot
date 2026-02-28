@@ -663,6 +663,20 @@ async def _save_paused_session(user_id: int, session: dict) -> None:
 
 async def _load_paused_session(user_id: int) -> dict | None:
     """Return the paused session dict if one exists and has not expired, else None."""
+
+    def _decode_jsonb(value, fallback):
+        """Handle JSONB decoded as text (default asyncpg) or native Python objects (custom codec)."""
+        if value is None:
+            return fallback
+        if isinstance(value, (list, dict)):
+            return value
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return fallback
+        return fallback
+
     async with _acquire() as conn:
         row = await conn.fetchrow(
             "SELECT questions, current_idx, answers, session_dates "
@@ -673,11 +687,11 @@ async def _load_paused_session(user_id: int) -> dict | None:
     if not row:
         return None
     return {
-        "questions":     json.loads(row["questions"]),
+        "questions":     _decode_jsonb(row["questions"], []),
         "current":       row["current_idx"],
-        "answers":       json.loads(row["answers"]),
+        "answers":       _decode_jsonb(row["answers"], []),
         "awaiting":      True,
-        "session_dates": json.loads(row["session_dates"]),
+        "session_dates": _decode_jsonb(row["session_dates"], []),
     }
 
 
