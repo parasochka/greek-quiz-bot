@@ -848,7 +848,7 @@ async def _generate_questions_openai(stats, session_dates, profile):
     print(f"[openai] sending request to gpt-5-mini (prompt ~{len(dynamic_prompt)} chars) …", flush=True)
     response = await client.chat.completions.create(
         model="gpt-5-mini",
-        max_completion_tokens=3000,
+        max_completion_tokens=16000,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": dynamic_prompt},
