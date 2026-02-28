@@ -1044,28 +1044,12 @@ async def _start_new_quiz(message, user_id):
         profile = await _load_profile(user_id) or {}
         print(f"[quiz] user={user_id} data loaded in {time.monotonic()-t_start:.1f}s, generating questions …", flush=True)
 
-        last_exc = None
-        questions = None
-        for attempt in range(3):
-            try:
-                print(f"[quiz] user={user_id} attempt {attempt+1}/3 calling generate_questions …", flush=True)
-                t_gen = time.monotonic()
-                questions = await asyncio.wait_for(
-                    generate_questions(stats, session_dates, profile),
-                    timeout=120.0,
-                )
-                print(f"[quiz] user={user_id} questions generated in {time.monotonic()-t_gen:.1f}s", flush=True)
-                break
-            except asyncio.TimeoutError:
-                last_exc = TimeoutError(f"generate_questions timed out on attempt {attempt+1}")
-                print(f"[quiz] user={user_id} TIMEOUT on attempt {attempt+1}", flush=True)
-            except Exception as exc:
-                last_exc = exc
-                print(f"[quiz] user={user_id} ERROR on attempt {attempt+1}: {type(exc).__name__}: {exc}", flush=True)
-            if attempt < 2:
-                await asyncio.sleep(2 ** attempt)  # 1s, 2s
-        if questions is None:
-            raise last_exc
+        t_gen = time.monotonic()
+        questions = await asyncio.wait_for(
+            generate_questions(stats, session_dates, profile),
+            timeout=90.0,
+        )
+        print(f"[quiz] user={user_id} questions generated in {time.monotonic()-t_gen:.1f}s", flush=True)
 
         session = {
             "questions": questions,
