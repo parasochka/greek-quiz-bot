@@ -919,7 +919,6 @@ async def _generate_questions_openai(stats, session_dates, profile):
                                             "type": "array",
                                             "minItems": 4,
                                             "maxItems": 4,
-                                            "uniqueItems": True,
                                             "items": {"type": "string"},
                                         },
                                         "correctIndex": {"type": "integer", "minimum": 0, "maximum": 3},
