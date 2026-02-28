@@ -208,6 +208,13 @@ def _daily_reminder_local_time(user_id: int, local_date: date):
     return local_date, hour, minute
 
 
+def _is_reminder_send_time(local_now: datetime, due_at: datetime, grace_minutes: int = 20) -> bool:
+    """Allow delivery only in a short post-slot window to avoid late-night blasts."""
+    if local_now < due_at:
+        return False
+    return local_now <= due_at + timedelta(minutes=grace_minutes)
+
+
 async def register_user(user):
     async with _acquire() as conn:
         await conn.execute(
@@ -1837,7 +1844,7 @@ async def daily_quiz_reminder(app):
                     local_now = utc_now.astimezone(tz)
                     local_date, hour, minute = _daily_reminder_local_time(user_id, local_now.date())
                     due_at = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                    if local_now < due_at:
+                    if not _is_reminder_send_time(local_now, due_at):
                         continue
 
                     already_sent = await conn.fetchval(
