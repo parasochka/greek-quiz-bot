@@ -6,6 +6,7 @@ import html
 import asyncio
 import contextlib
 import traceback
+import random
 import asyncpg
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -90,6 +91,7 @@ async def init_db():
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT FALSE")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status VARCHAR(20) DEFAULT 'free'")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone VARCHAR(64) DEFAULT 'Europe/Athens'")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_profiles (
                 user_id       BIGINT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
@@ -172,6 +174,31 @@ async def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS reminder_log (
+                user_id       BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                reminder_date DATE NOT NULL,
+                sent_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (user_id, reminder_date)
+            )
+        """)
+
+
+def _safe_zoneinfo(tz_name: str | None) -> ZoneInfo:
+    try:
+        return ZoneInfo(tz_name or "Europe/Athens")
+    except Exception:
+        return ZoneInfo("Europe/Athens")
+
+
+def _daily_reminder_local_time(user_id: int, local_date: date):
+    """Deterministic pseudo-random slot in [17:00, 20:00) for each user/day."""
+    start_minutes = 17 * 60
+    offset = random.Random(f"{user_id}:{local_date.isoformat()}").randrange(180)
+    total_minutes = start_minutes + offset
+    hour = total_minutes // 60
+    minute = total_minutes % 60
+    return local_date, hour, minute
 
 
 async def register_user(user):
@@ -1785,44 +1812,73 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def daily_quiz_reminder(app):
-    """Background task: at 18:00 Athens time send quiz reminder to users who haven't played today."""
-    athens_tz = ZoneInfo("Europe/Athens")
+    """Background task: sends one daily reminder in a random 17:00-20:00 local-time slot."""
     while True:
-        now_athens = datetime.now(athens_tz)
-        # Next 18:00 Athens
-        target_athens = now_athens.replace(hour=18, minute=0, second=0, microsecond=0)
-        if now_athens >= target_athens:
-            target_athens += timedelta(days=1)
-        wait_secs = (target_athens - now_athens).total_seconds()
-        await asyncio.sleep(wait_secs)
-
-        today_athens = datetime.now(athens_tz).date()
+        utc_now = datetime.now(timezone.utc)
         try:
             async with _acquire() as conn:
-                users = await conn.fetch("""
-                    SELECT u.telegram_id FROM users u
-                    WHERE u.onboarding_complete = TRUE
-                    AND u.telegram_id NOT IN (
-                        SELECT DISTINCT qs.user_id FROM quiz_sessions qs
-                        WHERE qs.session_date = $1
+                users = await conn.fetch(
+                    """
+                    SELECT telegram_id, timezone
+                    FROM users
+                    WHERE onboarding_complete = TRUE
+                    """
+                )
+                for user in users:
+                    user_id = user["telegram_id"]
+                    tz = _safe_zoneinfo(user["timezone"])
+                    local_now = utc_now.astimezone(tz)
+                    local_date, hour, minute = _daily_reminder_local_time(user_id, local_now.date())
+                    due_at = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    if local_now < due_at:
+                        continue
+
+                    already_sent = await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM reminder_log WHERE user_id=$1 AND reminder_date=$2)",
+                        user_id,
+                        local_date,
                     )
-                """, today_athens)
-            for user in users:
-                try:
-                    await app.bot.send_message(
-                        chat_id=user["telegram_id"],
-                        text=(
-                            "🔔 Сегодня ещё не было квиза!\n\n"
-                            "Нажми /quiz чтобы пройти - это займёт около минуты."
-                        ),
+                    if already_sent:
+                        continue
+
+                    already_completed = await conn.fetchval(
+                        """
+                        SELECT EXISTS(
+                            SELECT 1
+                            FROM quiz_sessions
+                            WHERE user_id = $1
+                              AND (completed_at AT TIME ZONE $2)::date = $3
+                        )
+                        """,
+                        user_id,
+                        str(tz.key),
+                        local_date,
                     )
-                    await asyncio.sleep(0.05)
-                except Exception as e:
-                    await log_admin_event(
-                        "WARN", "reminder_send_failed", f"Failed reminder delivery: {e}", user_id=user["telegram_id"],
-                    )
+                    if already_completed:
+                        continue
+
+                    try:
+                        await app.bot.send_message(
+                            chat_id=user_id,
+                            text=(
+                                "🔔 Сегодня ещё не было квиза!\n\n"
+                                "Нажми /quiz чтобы пройти - это займёт около минуты."
+                            ),
+                        )
+                        await conn.execute(
+                            "INSERT INTO reminder_log (user_id, reminder_date) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                            user_id,
+                            local_date,
+                        )
+                        await asyncio.sleep(0.05)
+                    except Exception as e:
+                        await log_admin_event(
+                            "WARN", "reminder_send_failed", f"Failed reminder delivery: {e}", user_id=user_id,
+                        )
         except Exception as e:
             await log_admin_event("ERROR", "reminder_db_error", f"Reminder DB error: {e}")
+
+        await asyncio.sleep(60)
 
 
 async def post_init(app):
