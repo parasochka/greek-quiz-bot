@@ -843,7 +843,7 @@ def _generate_questions_openai(stats, session_dates, profile):
     dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
     response = client.chat.completions.create(
         model="gpt-5-mini",
-        max_tokens=4000,
+        max_completion_tokens=4000,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": dynamic_prompt},
