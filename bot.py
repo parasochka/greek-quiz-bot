@@ -27,7 +27,7 @@ TG_TOKEN = _require_env("TELEGRAM_TOKEN")
 DATABASE_URL = _require_env("DATABASE_URL").replace("postgres://", "postgresql://", 1)
 
 # MODEL_PROVIDER: "claude" (default) or "openai"
-# Set MODEL_PROVIDER=openai and OPENAI_API_KEY to switch to GPT-5 mini.
+# Set MODEL_PROVIDER=openai and OPENAI_API_KEY to switch to gpt-4.1-mini.
 MODEL_PROVIDER = os.environ.get("MODEL_PROVIDER", "claude")
 
 if MODEL_PROVIDER == "openai":
@@ -845,11 +845,11 @@ async def _generate_questions_openai(stats, session_dates, profile):
     client = AsyncOpenAI(api_key=OPENAI_KEY, timeout=55.0)
     system_prompt = build_system_prompt(profile or {})
     dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
-    print(f"[openai] sending request to gpt-5-mini (prompt ~{len(dynamic_prompt)} chars) …", flush=True)
+    print(f"[openai] sending request to gpt-4.1-mini (prompt ~{len(dynamic_prompt)} chars) …", flush=True)
     response = await client.chat.completions.create(
-        model="gpt-5-mini",
-        max_completion_tokens=4000,
-        reasoning={"effort": "low"},
+        model="gpt-4.1-mini",
+        max_tokens=4000,
+        temperature=0.2,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": dynamic_prompt},
@@ -863,13 +863,13 @@ async def _generate_questions_openai(stats, session_dates, profile):
     print(f"[openai] finish_reason={finish!r}, content length={len(raw)} chars", flush=True)
     if finish == "length":
         raise ValueError(
-            f"GPT-5 mini обрезал ответ по лимиту токенов (finish_reason='length'). "
+            f"gpt-4.1-mini обрезал ответ по лимиту токенов (finish_reason='length'). "
             f"Первые 300 символов: {raw[:300]}"
         )
     if not raw:
-        raise ValueError(f"GPT-5 mini вернул пустой ответ (finish_reason={finish!r})")
+        raise ValueError(f"gpt-4.1-mini вернул пустой ответ (finish_reason={finish!r})")
     print(f"[openai] parsed response ok ({len(raw)} chars)", flush=True)
-    return _parse_questions(raw, "GPT-5 mini")
+    return _parse_questions(raw, "gpt-4.1-mini")
 
 
 async def generate_questions(stats, session_dates, profile):
