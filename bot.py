@@ -879,19 +879,10 @@ async def _generate_questions_openai(stats, session_dates, profile):
 
 
 async def generate_questions(stats, session_dates, profile):
-    last_error = None
-    for attempt in range(3):
-        try:
-            if MODEL_PROVIDER == "openai":
-                return await _generate_questions_openai(stats, session_dates, profile)
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, _generate_questions_claude, stats, session_dates, profile)
-        except ValueError as e:
-            last_error = e
-            print(f"[quiz] generation attempt {attempt + 1}/3 failed: {e}", flush=True)
-            if attempt < 2:
-                continue
-    raise last_error
+    if MODEL_PROVIDER == "openai":
+        return await _generate_questions_openai(stats, session_dates, profile)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _generate_questions_claude, stats, session_dates, profile)
 
 # ─── Session storage ───────────────────────────────────────────────────────────
 
