@@ -849,7 +849,7 @@ async def _generate_questions_openai(stats, session_dates, profile):
     response = await client.chat.completions.create(
         model="gpt-4.1-mini",
         max_tokens=4000,
-        temperature=0.7,
+        temperature=0.2,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": dynamic_prompt},
