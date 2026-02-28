@@ -1199,7 +1199,7 @@ async def _generate_questions_openai(stats, session_dates, profile, required_top
     retry_hint = ""
     last_error = None
 
-    print(f"[openai] creating async client …", flush=True)
+    print("[openai] creating async client …", flush=True)
     for attempt in range(1, max_attempts + 1):
         t0 = time.monotonic()
         user_prompt = f"{dynamic_prompt}{retry_hint}"
