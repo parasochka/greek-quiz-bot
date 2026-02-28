@@ -1036,6 +1036,7 @@ async def start_quiz(message, user_id):
 async def _start_new_quiz(message, user_id):
     """Generate fresh questions and start a new quiz, discarding any paused state."""
     import time
+    import traceback
     msg = await message.reply_text("⏳ Готовлю квиз... Это займёт около минуты.")
     try:
         t_start = time.monotonic()
@@ -1062,8 +1063,19 @@ async def _start_new_quiz(message, user_id):
         await _save_paused_session(user_id, session)
         await msg.delete()
         await send_question(message, user_id)
+    except asyncio.TimeoutError:
+        print(f"[quiz] user={user_id} TIMEOUT: OpenAI did not respond in 90s", flush=True)
+        try:
+            await msg.edit_text("❌ OpenAI не ответил за 90 секунд.\n\nПопробуй ещё раз через /quiz")
+        except Exception:
+            pass
     except Exception as e:
-        await msg.edit_text(f"❌ Не удалось загрузить квиз: {e}\n\nПопробуй ещё раз через /quiz")
+        print(f"[quiz] user={user_id} ERROR: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        try:
+            await msg.edit_text(f"❌ Ошибка: {type(e).__name__}: {e}\n\nПопробуй ещё раз через /quiz")
+        except Exception:
+            pass
 
 async def send_question(message, user_id):
     session = user_sessions[user_id]
