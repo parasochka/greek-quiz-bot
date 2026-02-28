@@ -847,7 +847,7 @@ def _generate_questions_openai(stats, session_dates, profile):
     print(f"[openai] sending request to gpt-5-mini (prompt ~{len(dynamic_prompt)} chars) …", flush=True)
     response = client.chat.completions.create(
         model="gpt-5-mini",
-        max_completion_tokens=4000,
+        max_completion_tokens=8000,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": dynamic_prompt},
@@ -856,9 +856,15 @@ def _generate_questions_openai(stats, session_dates, profile):
     elapsed = time.monotonic() - t0
     print(f"[openai] response received in {elapsed:.1f}s", flush=True)
     choice = response.choices[0]
+    finish = choice.finish_reason
     raw = (choice.message.content or "").strip()
+    print(f"[openai] finish_reason={finish!r}, content length={len(raw)} chars", flush=True)
+    if finish == "length":
+        raise ValueError(
+            f"GPT-5 mini обрезал ответ по лимиту токенов (finish_reason='length'). "
+            f"Первые 300 символов: {raw[:300]}"
+        )
     if not raw:
-        finish = choice.finish_reason
         raise ValueError(f"GPT-5 mini вернул пустой ответ (finish_reason={finish!r})")
     print(f"[openai] parsed response ok ({len(raw)} chars)", flush=True)
     return _parse_questions(raw, "GPT-5 mini")
