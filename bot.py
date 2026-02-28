@@ -4,7 +4,6 @@ import json
 import html
 import random
 import asyncio
-import difflib
 import contextlib
 import unicodedata
 import asyncpg
@@ -15,31 +14,29 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from telegram.error import BadRequest, Conflict
 from openai import AsyncOpenAI
 
-def _require_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise SystemExit(
-            f"ERROR: Required environment variable '{name}' is not set.\n"
-            f"Add it to your deployment settings (Railway → Variables)."
-        )
-    return value
+from config import (
+    ALLOWED_USERNAMES,
+    DATABASE_URL,
+    LETTERS,
+    MAIN_MENU_KEYBOARD,
+    ONBOARDING_STEPS,
+    OPENAI_KEY,
+    OPENAI_MAX_ATTEMPTS,
+    OPENAI_REQUEST_TIMEOUT_SEC,
+    OPENAI_TEMPERATURE,
+    PAUSED_SESSION_TTL_HOURS,
+    QUIZ_GENERATION_TIMEOUT_SEC,
+    QUIZ_QUESTION_COUNT,
+    STATE_ONBOARDING,
+    STATE_SETTINGS_EDIT,
+    TG_TOKEN,
+    TRIBUTE_URL,
+    WELCOME_TEXT,
+)
+from topics import MASTER_TOPICS, build_topic_sequence, normalize_topic
 
-TG_TOKEN = _require_env("TELEGRAM_TOKEN")
-DATABASE_URL = _require_env("DATABASE_URL").replace("postgres://", "postgresql://", 1)
-
-# The bot now uses only ChatGPT API for quiz generation.
-OPENAI_KEY = _require_env("OPENAI_API_KEY")
-OPENAI_REQUEST_TIMEOUT_SEC = float(os.environ.get("OPENAI_REQUEST_TIMEOUT_SEC", "45"))
-QUIZ_GENERATION_TIMEOUT_SEC = float(os.environ.get("QUIZ_GENERATION_TIMEOUT_SEC", "120"))
-OPENAI_MAX_ATTEMPTS = int(os.environ.get("OPENAI_MAX_ATTEMPTS", "3"))
-OPENAI_TEMPERATURE = float(os.environ.get("OPENAI_TEMPERATURE", "0.55"))
-
-# How long a paused (in-progress) quiz session is kept in the DB before expiry.
-# Configurable via env var PAUSED_SESSION_TTL_HOURS (default: 24 hours).
-PAUSED_SESSION_TTL_HOURS = int(os.environ.get("PAUSED_SESSION_TTL_HOURS", "24"))
 
 db_pool = None
-QUIZ_QUESTION_COUNT = 20
 
 
 @contextlib.asynccontextmanager
@@ -48,97 +45,9 @@ async def _acquire():
         yield conn
 
 
-LETTERS = ["А", "Б", "В", "Г"]
-
-OWNER_USERNAME = "aparasochka"
-ALLOWED_USERNAMES = {OWNER_USERNAME, "immangosteen", "holycolorama", "akulovv", "xaaru"}
-TRIBUTE_URL = os.environ.get("TRIBUTE_URL", "https://t.me/tribute")
-
-
 def is_access_allowed(user) -> bool:
     """Currently only allowed users have access. Future: check subscription_status."""
     return user.username in ALLOWED_USERNAMES
-
-
-# ─── Onboarding ───────────────────────────────────────────────────────────────
-
-STATE_ONBOARDING = "onboarding"
-STATE_SETTINGS_EDIT = "settings_edit"
-
-ONBOARDING_STEPS = [
-    {"key": "display_name", "q": "Как тебя называть?",                              "type": "text"},
-    {"key": "age",          "q": "Сколько тебе лет?",                               "type": "text"},
-    {"key": "city",         "q": "В каком городе проживаешь?",                      "type": "text"},
-    {"key": "native_lang",  "q": "Твой родной язык:",                               "type": "choice",
-     "options": ["Русский", "Украинский", "Другой"]},
-    {"key": "other_langs",  "q": "Другие языки кроме родного:",                     "type": "choice",
-     "options": ["Английский (хорошо)", "Английский (базовый)", "Нет других"]},
-    {"key": "occupation",   "q": "Чем занимаешься? (работа, учёба)",                "type": "text"},
-    {"key": "family",       "q": "Семья - дети, партнёр? (или напиши «нет»)",       "type": "text"},
-    {"key": "hobbies",      "q": "Хобби и интересы:",                               "type": "text"},
-    {"key": "greek_goal",   "q": "Где планируешь применять греческий? (например: кафе, соседи, работа)", "type": "text"},
-    {"key": "exam_date",    "q": "Есть дата экзамена? (ДД.ММ.ГГГГ или «нет»)",     "type": "text"},
-]
-
-WELCOME_TEXT = (
-    "👋 Привет! Я помогу тебе учить греческий язык (уровень A2).\n\n"
-    "🤖 <b>Как это работает:</b>\n"
-    "• Квизы из 20 вопросов - сколько хочешь в день\n"
-    "• Все вопросы генерирует AI на основе твоего профиля\n"
-    "• Первые 3 дня - знакомство с твоим уровнем\n"
-    "• С 4-го дня - умная адаптация: слабые темы чаще, сильные реже\n"
-    "• После каждого ответа - объяснение правила\n\n"
-    "💶 <b>Стоимость:</b> первые 3 дня бесплатно, затем <b>10 € в месяц</b>.\n"
-    "Подписка через Tribute покрывает AI-токены для генерации вопросов.\n\n"
-    "⚠️ <i>Вопросы созданы искусственным интеллектом - возможны неточности.</i>\n\n"
-    "Чтобы начать, расскажи немного о себе - займёт 2 минуты."
-)
-
-MAIN_MENU_KEYBOARD = [
-    [InlineKeyboardButton("🎯 Начать квиз",    callback_data="menu_quiz")],
-    [InlineKeyboardButton("📊 Моя статистика", callback_data="menu_stats")],
-    [InlineKeyboardButton("⚙️ Настройки",      callback_data="menu_settings")],
-    [InlineKeyboardButton("ℹ️ О боте",          callback_data="menu_about")],
-]
-
-# Canonical topic names — used to detect unseen topics and enforce consistent Stats keys.
-# ChatGPT is instructed to use EXACTLY these strings in the "topic" field of each question.
-MASTER_TOPICS = [
-    "Глаголы",
-    "Прошедшее время",
-    "Будущее время",
-    "Отрицание",
-    "Местоимения",
-    "Артикли",
-    "Существительные",
-    "Прилагательные",
-    "Указательные местоимения",
-    "Числа",
-    "Вопросительные слова",
-    "Предлоги и союзы",
-    "Бытовые ситуации",
-    "Время и дата",
-    "Семья",
-    "Части тела",
-    "Погода",
-    "Дом и квартира",
-    "Еда и продукты",
-    "Одежда",
-    "Наречия",
-]
-
-
-def normalize_topic(topic: str) -> str:
-    """Map API-returned topic to the nearest canonical MASTER_TOPICS name.
-
-    The model may occasionally mix in visually similar Greek characters (e.g. ο, ι, Και)
-    inside otherwise-Cyrillic topic names. difflib finds the closest match so
-    statistics are always recorded under the correct canonical key.
-    """
-    if topic in MASTER_TOPICS:
-        return topic
-    matches = difflib.get_close_matches(topic, MASTER_TOPICS, n=1, cutoff=0.6)
-    return matches[0] if matches else topic
 
 
 def h(text):
@@ -420,94 +329,6 @@ async def _load_topic_memory(user_id: int) -> dict:
         }
         for r in rows
     }
-
-
-def build_topic_sequence(stats: dict, session_dates: list, topic_memory: dict, total_questions: int = QUIZ_QUESTION_COUNT) -> list[str]:
-    """Server-side topic scheduler for spaced repetition (returns exact per-slot topics)."""
-    today = date.today()
-    learning_mode = len(session_dates) < 3
-
-    def acc(topic: str) -> float:
-        s = stats.get(topic, {"correct": 0, "total": 0})
-        return (s["correct"] / s["total"]) if s.get("total") else 0.0
-
-    def overdue_days(topic: str) -> int:
-        mem = topic_memory.get(topic) or {}
-        due_s = mem.get("due_at")
-        if not due_s:
-            return 0
-        try:
-            due = date.fromisoformat(due_s)
-        except ValueError:
-            return 0
-        return max((today - due).days, 0)
-
-    def last_seen_days(topic: str) -> int:
-        mem = topic_memory.get(topic) or {}
-        last_s = mem.get("last_seen")
-        if not last_s:
-            s = stats.get(topic, {})
-            last_s = s.get("last_seen")
-        if not last_s:
-            return 999
-        try:
-            last = date.fromisoformat(last_s)
-        except ValueError:
-            return 999
-        return (today - last).days
-
-    seen_topics = {t for t, s in stats.items() if s.get("total", 0) > 0}
-    unseen_topics = [t for t in MASTER_TOPICS if t not in seen_topics]
-    weak_topics = [t for t in MASTER_TOPICS if t in seen_topics and acc(t) < 0.60]
-    medium_topics = [t for t in MASTER_TOPICS if t in seen_topics and 0.60 <= acc(t) < 0.85]
-    strong_topics = [t for t in MASTER_TOPICS if t in seen_topics and acc(t) >= 0.85]
-
-    def sort_pool(pool: list[str], weakest_first: bool) -> list[str]:
-        return sorted(
-            pool,
-            key=lambda t: (
-                -overdue_days(t),
-                acc(t) if weakest_first else -acc(t),
-                -last_seen_days(t),
-            ),
-        )
-
-    sequence = []
-
-    def fill_from_pool(pool: list[str], n: int, weakest_first: bool = True):
-        if n <= 0 or not pool:
-            return
-        ordered = sort_pool(pool, weakest_first=weakest_first)
-        i = 0
-        while len(sequence) < total_questions and n > 0 and ordered:
-            sequence.append(ordered[i % len(ordered)])
-            i += 1
-            n -= 1
-
-    if learning_mode:
-        fill_from_pool(unseen_topics, min(5, total_questions), weakest_first=True)
-        fill_from_pool([t for t in MASTER_TOPICS if t not in unseen_topics],
-                       total_questions - len(sequence), weakest_first=True)
-    else:
-        quotas = {
-            "weak": round(total_questions * 0.35),
-            "medium": round(total_questions * 0.25),
-            "strong": round(total_questions * 0.10),
-            "unseen": total_questions - round(total_questions * 0.35) - round(total_questions * 0.25) - round(total_questions * 0.10),
-        }
-        fill_from_pool(weak_topics, quotas["weak"], weakest_first=True)
-        fill_from_pool(medium_topics, quotas["medium"], weakest_first=True)
-        fill_from_pool(strong_topics, quotas["strong"], weakest_first=False)
-        fill_from_pool(unseen_topics, quotas["unseen"], weakest_first=True)
-
-        if len(sequence) < total_questions:
-            fill_from_pool(MASTER_TOPICS, total_questions - len(sequence), weakest_first=True)
-
-    if len(sequence) < total_questions:
-        fill_from_pool(MASTER_TOPICS, total_questions - len(sequence), weakest_first=True)
-
-    random.shuffle(sequence)
-    return sequence[:total_questions]
 
 
 async def _update_topic_memory_for_answer(conn, user_id: int, topic: str, correct: bool) -> None:
