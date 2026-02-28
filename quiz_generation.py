@@ -486,7 +486,7 @@ async def _repair_questions_openai(client, system_prompt: str, questions: list, 
     )
 
     response = await client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-4o-mini",
         max_tokens=1800,
         temperature=OPENAI_TEMPERATURE,
         response_format={
@@ -532,7 +532,7 @@ async def _repair_questions_openai(client, system_prompt: str, questions: list, 
         ],
     )
     raw = (response.choices[0].message.content or "").strip()
-    return _extract_questions(raw, "gpt-4.1-mini repair", expected_count=n)
+    return _extract_questions(raw, "gpt-4o-mini repair", expected_count=n)
 
 
 async def _generate_questions_openai(stats, session_dates, profile, required_topics=None):
@@ -548,11 +548,11 @@ async def _generate_questions_openai(stats, session_dates, profile, required_top
         t0 = time.monotonic()
         user_prompt = f"{dynamic_prompt}{retry_hint}"
         print(
-            f"[openai] sending request to gpt-4.1-mini (attempt {attempt}/{max_attempts}, prompt ~{len(user_prompt)} chars) …",
+            f"[openai] sending request to gpt-4o-mini (attempt {attempt}/{max_attempts}, prompt ~{len(user_prompt)} chars) …",
             flush=True,
         )
         response = await client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-4o-mini",
             max_tokens=4500,
             temperature=OPENAI_TEMPERATURE,
             response_format={
@@ -604,12 +604,12 @@ async def _generate_questions_openai(stats, session_dates, profile, required_top
         raw = (choice.message.content or "").strip()
         print(f"[openai] finish_reason={finish!r}, content length={len(raw)} chars", flush=True)
         if finish == "length":
-            raise ValueError("gpt-4.1-mini обрезал ответ по лимиту токенов (finish_reason='length').")
+            raise ValueError("gpt-4o-mini обрезал ответ по лимиту токенов (finish_reason='length').")
         if not raw:
-            last_error = ValueError(f"gpt-4.1-mini вернул пустой ответ (finish_reason={finish!r})")
+            last_error = ValueError(f"gpt-4o-mini вернул пустой ответ (finish_reason={finish!r})")
         else:
             try:
-                parsed = _extract_questions(raw, "gpt-4.1-mini")
+                parsed = _extract_questions(raw, "gpt-4o-mini")
 
                 # Fast path: repair only broken question slots instead of full-regenerating all 20.
                 for repair_round in range(1, 3):

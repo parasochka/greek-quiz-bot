@@ -1880,7 +1880,7 @@ async def daily_quiz_reminder(app):
                             ),
                         )
                         await conn.execute(
-                            "INSERT INTO reminder_log (user_id, reminder_date) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                            "INSERT INTO reminder_log (user_id, reminder_date) VALUES ($1, $2) ON CONFLICT (user_id, reminder_date) DO NOTHING",
                             user_id,
                             local_date,
                         )
