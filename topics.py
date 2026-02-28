@@ -119,9 +119,7 @@ def build_topic_sequence(
         fill_from_pool(strong_topics, quotas["strong"], weakest_first=False)
         fill_from_pool(unseen_topics, quotas["unseen"], weakest_first=True)
 
-        if len(sequence) < total_questions:
-            fill_from_pool(MASTER_TOPICS, total_questions - len(sequence), weakest_first=True)
-
+    # Final safety net for both modes: fill remaining slots from all topics
     if len(sequence) < total_questions:
         fill_from_pool(MASTER_TOPICS, total_questions - len(sequence), weakest_first=True)
 
