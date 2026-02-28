@@ -24,13 +24,13 @@ from config import (
     OPENAI_MAX_ATTEMPTS,
     OPENAI_REQUEST_TIMEOUT_SEC,
     OPENAI_TEMPERATURE,
+    OWNER_USERNAME,
     PAUSED_SESSION_TTL_HOURS,
     QUIZ_GENERATION_TIMEOUT_SEC,
     QUIZ_QUESTION_COUNT,
     STATE_ONBOARDING,
     STATE_SETTINGS_EDIT,
     TG_TOKEN,
-    TRIBUTE_URL,
     WELCOME_TEXT,
 )
 from topics import MASTER_TOPICS, build_topic_sequence, normalize_topic
@@ -1378,7 +1378,10 @@ async def _start_new_quiz(message, user_id):
             pass
 
 async def send_question(message, user_id):
-    session = user_sessions[user_id]
+    session = user_sessions.get(user_id)
+    if session is None:
+        await message.reply_text("⚠️ Сессия не найдена. Начни квиз заново через /quiz")
+        return
     q = session["questions"][session["current"]]
     num = session["current"] + 1
     total = len(session["questions"])
@@ -1813,6 +1816,10 @@ async def finish_quiz(message, user_id):
 
     correct_count = sum(1 for a in answers if a["correct"])
     total = len(answers)
+    if total == 0:
+        await message.reply_text("⚠️ Квиз завершён, но ответов не найдено.")
+        del user_sessions[user_id]
+        return
     pct   = round(correct_count / total * 100)
 
     # Per-topic results this session
@@ -1906,6 +1913,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_stats(message, user_id: int):
     try:
         stats, session_dates = await _load_compact_data(user_id)
+        async with _acquire() as conn:
+            total_sessions = await conn.fetchval(
+                "SELECT COUNT(*) FROM quiz_sessions WHERE user_id=$1", user_id
+            ) or 0
     except Exception as e:
         await message.reply_text(f"❌ Ошибка загрузки статистики: {e}")
         return
@@ -1917,7 +1928,6 @@ async def show_stats(message, user_id: int):
     streak_cur, streak_best = calc_streak(session_dates)
     total_questions = sum(s["total"]   for s in stats.values())
     total_correct   = sum(s["correct"] for s in stats.values())
-    total_sessions  = total_questions // 20  # each quiz is exactly 20 questions
     overall_pct     = round(total_correct / total_questions * 100) if total_questions else 0
 
     learning_days = len(session_dates)
