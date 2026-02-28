@@ -979,7 +979,7 @@ async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
-    await start_quiz(update.message, update.effective_user.id)
+    await start_quiz(update.message, update.effective_user.id, username=update.effective_user.username)
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -997,7 +997,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         await query.message.reply_text("⏳ Запускаю квиз...")
-        await start_quiz(query.message, query.from_user.id)
+        await start_quiz(query.message, query.from_user.id, username=query.from_user.username)
 
     elif query.data == "menu_stats":
         await show_stats(query.message, query.from_user.id)
@@ -1025,13 +1025,25 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
 
-async def start_quiz(message, user_id):
+async def start_quiz(message, user_id, username=None):
     # Restore a paused session if one exists (survives bot restarts and device switches).
     paused = await _load_paused_session(user_id)
     if paused:
-        user_sessions[user_id] = paused
         answered = paused["current"]
         total = len(paused["questions"])
+        # Owner gets a choice: resume paused session or start fresh (for testing).
+        if username == OWNER_USERNAME:
+            keyboard = [[
+                InlineKeyboardButton("▶️ Продолжить", callback_data="quiz_resume"),
+                InlineKeyboardButton("🔄 Начать заново", callback_data="quiz_restart"),
+            ]]
+            await message.reply_text(
+                f"⏸ Есть незавершённый квиз ({answered} из {total} вопросов пройдено).\n\n"
+                f"Продолжить или начать новый?",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
+        user_sessions[user_id] = paused
         await message.reply_text(
             f"⏸ Продолжаю незавершённый квиз ({answered} из {total} вопросов пройдено).",
         )
@@ -1318,6 +1330,39 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("✅ Отмена. История не тронута.")
+        return
+
+    # ── Owner-only: resume paused quiz ──
+    if data == "quiz_resume":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_reply_markup(reply_markup=None)
+        paused = await _load_paused_session(user_id)
+        if paused:
+            user_sessions[user_id] = paused
+            answered = paused["current"]
+            total = len(paused["questions"])
+            await query.message.reply_text(
+                f"⏸ Продолжаю незавершённый квиз ({answered} из {total} вопросов пройдено).",
+            )
+            await send_question(query.message, user_id)
+        else:
+            await _start_new_quiz(query.message, user_id)
+        return
+
+    # ── Owner-only: discard paused quiz and start fresh ──
+    if data == "quiz_restart":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_reply_markup(reply_markup=None)
+        await _delete_paused_session(user_id)
+        if user_id in user_sessions:
+            del user_sessions[user_id]
+        await _start_new_quiz(query.message, user_id)
         return
 
     # ── Quiz answer ──
