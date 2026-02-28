@@ -1,4 +1,5 @@
 import os
+import json
 import signal
 import time
 import html
@@ -28,7 +29,7 @@ from config import (
     WELCOME_TEXT,
 )
 from topics import MASTER_TOPICS, build_topic_sequence
-from quiz_generation import TYPE_LABELS, generate_questions
+from quiz_generation import TYPE_LABELS, TYPE_NAMES_RU, generate_questions
 
 
 db_pool = None
