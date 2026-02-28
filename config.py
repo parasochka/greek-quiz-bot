@@ -49,7 +49,7 @@ ONBOARDING_STEPS = [
 ]
 
 WELCOME_TEXT = (
-    "👋 Привет! Я помогу тебе учить греческий язык (уровень A2).\n\n"
+    "👋 Привет! Я Greekly - помогу тебе учить греческий язык (уровень A2).\n\n"
     "🤖 <b>Как это работает:</b>\n"
     "• Квизы из 20 вопросов - сколько хочешь в день\n"
     "• Все вопросы генерирует AI на основе твоего профиля\n"
@@ -66,5 +66,5 @@ MAIN_MENU_KEYBOARD = [
     [InlineKeyboardButton("🎯 Начать квиз", callback_data="menu_quiz")],
     [InlineKeyboardButton("📊 Моя статистика", callback_data="menu_stats")],
     [InlineKeyboardButton("⚙️ Настройки", callback_data="menu_settings")],
-    [InlineKeyboardButton("ℹ️ О боте", callback_data="menu_about")],
+    [InlineKeyboardButton("ℹ️ О Greekly", callback_data="menu_about")],
 ]
