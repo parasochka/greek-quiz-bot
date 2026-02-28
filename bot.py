@@ -838,22 +838,35 @@ def _generate_questions_claude(stats, session_dates, profile):
 
 
 def _generate_questions_openai(stats, session_dates, profile):
-    client = OpenAI(api_key=OPENAI_KEY)
+    import time
+    t0 = time.monotonic()
+    print(f"[openai] creating client …", flush=True)
+    client = OpenAI(api_key=OPENAI_KEY, timeout=90.0)
     system_prompt = build_system_prompt(profile or {})
     dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
+    print(f"[openai] sending request to gpt-5-mini (prompt ~{len(dynamic_prompt)} chars) …", flush=True)
     response = client.chat.completions.create(
         model="gpt-5-mini",
-        max_completion_tokens=4000,
+        max_completion_tokens=8000,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": dynamic_prompt},
         ],
     )
+    elapsed = time.monotonic() - t0
+    print(f"[openai] response received in {elapsed:.1f}s", flush=True)
     choice = response.choices[0]
+    finish = choice.finish_reason
     raw = (choice.message.content or "").strip()
+    print(f"[openai] finish_reason={finish!r}, content length={len(raw)} chars", flush=True)
+    if finish == "length":
+        raise ValueError(
+            f"GPT-5 mini обрезал ответ по лимиту токенов (finish_reason='length'). "
+            f"Первые 300 символов: {raw[:300]}"
+        )
     if not raw:
-        finish = choice.finish_reason
         raise ValueError(f"GPT-5 mini вернул пустой ответ (finish_reason={finish!r})")
+    print(f"[openai] parsed response ok ({len(raw)} chars)", flush=True)
     return _parse_questions(raw, "GPT-5 mini")
 
 
@@ -1020,22 +1033,36 @@ async def start_quiz(message, user_id):
 
 async def _start_new_quiz(message, user_id):
     """Generate fresh questions and start a new quiz, discarding any paused state."""
+    import time
     msg = await message.reply_text("⏳ Готовлю квиз... Это займёт около минуты.")
     try:
+        t_start = time.monotonic()
+        print(f"[quiz] user={user_id} loading data …", flush=True)
         stats, session_dates = await _load_compact_data(user_id)
         profile = await _load_profile(user_id) or {}
+        print(f"[quiz] user={user_id} data loaded in {time.monotonic()-t_start:.1f}s, generating questions …", flush=True)
 
         loop = asyncio.get_running_loop()
         last_exc = None
         questions = None
         for attempt in range(3):
             try:
-                questions = await loop.run_in_executor(None, generate_questions, stats, session_dates, profile)
+                print(f"[quiz] user={user_id} attempt {attempt+1}/3 calling generate_questions …", flush=True)
+                t_gen = time.monotonic()
+                questions = await asyncio.wait_for(
+                    loop.run_in_executor(None, generate_questions, stats, session_dates, profile),
+                    timeout=120.0,
+                )
+                print(f"[quiz] user={user_id} questions generated in {time.monotonic()-t_gen:.1f}s", flush=True)
                 break
+            except asyncio.TimeoutError:
+                last_exc = TimeoutError(f"generate_questions timed out on attempt {attempt+1}")
+                print(f"[quiz] user={user_id} TIMEOUT on attempt {attempt+1}", flush=True)
             except Exception as exc:
                 last_exc = exc
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)  # 1s, 2s
+                print(f"[quiz] user={user_id} ERROR on attempt {attempt+1}: {type(exc).__name__}: {exc}", flush=True)
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)  # 1s, 2s
         if questions is None:
             raise last_exc
 
