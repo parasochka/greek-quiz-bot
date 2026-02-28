@@ -1318,6 +1318,16 @@ async def generate_questions(stats, session_dates, profile, required_topics=None
 # ─── Session storage ───────────────────────────────────────────────────────────
 
 user_sessions = {}
+user_answer_locks = {}
+
+
+def _get_user_answer_lock(user_id: int) -> asyncio.Lock:
+    """Serialize answer callbacks per user to avoid race conditions on rapid taps."""
+    lock = user_answer_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        user_answer_locks[user_id] = lock
+    return lock
 
 # ─── Handlers ──────────────────────────────────────────────────────────────────
 
@@ -1539,8 +1549,9 @@ async def send_question(message, user_id):
     total = len(session["questions"])
 
     type_label = TYPE_LABELS.get(q.get("type", ""), "❓ Вопрос")
+    question_idx = session["current"]
     keyboard = [
-        [InlineKeyboardButton(f"{LETTERS[i]}. {opt}", callback_data=f"ans_{i}")]
+        [InlineKeyboardButton(f"{LETTERS[i]}. {opt}", callback_data=f"ans_{question_idx}_{i}")]
         for i, opt in enumerate(q["options"])
     ]
     await message.reply_text(
@@ -1856,91 +1867,109 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    if user_id not in user_sessions:
-        # Try to restore a paused session from the DB (e.g. after bot restart or from another device).
-        paused = await _load_paused_session(user_id)
-        if paused:
-            user_sessions[user_id] = paused
-        else:
+    lock = _get_user_answer_lock(user_id)
+    async with lock:
+        if user_id not in user_sessions:
+            # Try to restore a paused session from the DB (e.g. after bot restart or from another device).
+            paused = await _load_paused_session(user_id)
+            if paused:
+                user_sessions[user_id] = paused
+            else:
+                try:
+                    await query.answer("Сессия истекла. Напиши /quiz чтобы начать заново.")
+                except Exception:
+                    pass
+                return
+
+        session = user_sessions[user_id]
+        if not session.get("awaiting"):
             try:
-                await query.answer("Сессия истекла. Напиши /quiz чтобы начать заново.")
+                await query.answer("Ответ уже принят.")
             except Exception:
                 pass
             return
 
-    session = user_sessions[user_id]
-    if not session.get("awaiting"):
+        parts = data.split("_")
+        try:
+            if len(parts) == 3:
+                q_idx = int(parts[1])
+                selected = int(parts[2])
+            else:
+                # Backward compatibility with old callback format ans_<option>.
+                q_idx = session["current"]
+                selected = int(parts[1])
+        except (IndexError, ValueError):
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            return
+
+        if q_idx != session["current"]:
+            try:
+                await query.answer("Этот вопрос уже закрыт.")
+            except Exception:
+                pass
+            await _clear_reply_markup()
+            return
+
+        if not (0 <= selected <= 3):
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            return
+
+        # Acknowledge the callback query immediately — Telegram requires this within 10 seconds.
+        # All subsequent work (edit, reply, ChatGPT API) can take much longer.
         try:
             await query.answer()
         except Exception:
             pass
-        return
 
-    try:
-        selected = int(data.split("_")[1])
-    except (IndexError, ValueError):
-        try:
-            await query.answer()
-        except Exception:
-            pass
-        return
-    if not (0 <= selected <= 3):
-        try:
-            await query.answer()
-        except Exception:
-            pass
-        return
+        session["awaiting"] = False
+        q = session["questions"][session["current"]]
+        correct = selected == q["correctIndex"]
 
-    # Acknowledge the callback query immediately — Telegram requires this within 10 seconds.
-    # All subsequent work (edit, reply, ChatGPT API) can take much longer.
-    try:
-        await query.answer()
-    except Exception:
-        pass
+        session["answers"].append({
+            "topic": q["topic"],
+            "type":  q["type"],
+            "correct": correct,
+        })
 
-    session["awaiting"] = False
-    q = session["questions"][session["current"]]
-    correct = selected == q["correctIndex"]
+        correct_letter = LETTERS[q["correctIndex"]]
+        correct_text   = q["options"][q["correctIndex"]]
 
-    session["answers"].append({
-        "topic": q["topic"],
-        "type":  q["type"],
-        "correct": correct,
-    })
+        if correct:
+            result = (
+                f"✅ <b>Верно!</b>\n\n"
+                f"<b>{h(correct_letter)}. {h(correct_text)}</b>\n\n"
+                f"💡 {h(q['explanation'])}"
+            )
+        else:
+            sel_letter = LETTERS[selected]
+            sel_text   = q["options"][selected]
+            result = (
+                f"❌ <b>Неверно.</b>\n\n"
+                f"Твой ответ: {h(sel_letter)}. {h(sel_text)}\n"
+                f"✅ Правильный ответ: <b>{h(correct_letter)}. {h(correct_text)}</b>\n\n"
+                f"💡 {h(q['explanation'])}"
+            )
 
-    correct_letter = LETTERS[q["correctIndex"]]
-    correct_text   = q["options"][q["correctIndex"]]
+        await _clear_reply_markup()
+        await query.message.reply_text(result, parse_mode="HTML")
 
-    if correct:
-        result = (
-            f"✅ <b>Верно!</b>\n\n"
-            f"<b>{h(correct_letter)}. {h(correct_text)}</b>\n\n"
-            f"💡 {h(q['explanation'])}"
-        )
-    else:
-        sel_letter = LETTERS[selected]
-        sel_text   = q["options"][selected]
-        result = (
-            f"❌ <b>Неверно.</b>\n\n"
-            f"Твой ответ: {h(sel_letter)}. {h(sel_text)}\n"
-            f"✅ Правильный ответ: <b>{h(correct_letter)}. {h(correct_text)}</b>\n\n"
-            f"💡 {h(q['explanation'])}"
-        )
-
-    await _clear_reply_markup()
-    await query.message.reply_text(result, parse_mode="HTML")
-
-    session["current"] += 1
-    if session["current"] >= len(session["questions"]):
-        await finish_quiz(query.message, user_id)
-    else:
-        session["awaiting"] = True
-        # Persist progress after each answer so the quiz can be resumed from any device.
-        try:
-            await _save_paused_session(user_id, session)
-        except Exception as e:
-            print(f"[paused_session] save error: {e}")
-        await send_question(query.message, user_id)
+        session["current"] += 1
+        if session["current"] >= len(session["questions"]):
+            await finish_quiz(query.message, user_id)
+        else:
+            session["awaiting"] = True
+            # Persist progress after each answer so the quiz can be resumed from any device.
+            try:
+                await _save_paused_session(user_id, session)
+            except Exception as e:
+                print(f"[paused_session] save error: {e}")
+            await send_question(query.message, user_id)
 
 async def finish_quiz(message, user_id):
     session = user_sessions[user_id]
