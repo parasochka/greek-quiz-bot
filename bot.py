@@ -12,6 +12,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotComm
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 from telegram.error import Conflict
 import anthropic
+from openai import OpenAI
 
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
@@ -22,9 +23,19 @@ def _require_env(name: str) -> str:
         )
     return value
 
-ANTHROPIC_KEY = _require_env("ANTHROPIC_API_KEY")
 TG_TOKEN = _require_env("TELEGRAM_TOKEN")
 DATABASE_URL = _require_env("DATABASE_URL").replace("postgres://", "postgresql://", 1)
+
+# MODEL_PROVIDER: "claude" (default) or "openai"
+# Set MODEL_PROVIDER=openai and OPENAI_API_KEY to switch to GPT-5 mini.
+MODEL_PROVIDER = os.environ.get("MODEL_PROVIDER", "claude")
+
+if MODEL_PROVIDER == "openai":
+    OPENAI_KEY = _require_env("OPENAI_API_KEY")
+    ANTHROPIC_KEY = None
+else:
+    ANTHROPIC_KEY = _require_env("ANTHROPIC_API_KEY")
+    OPENAI_KEY = None
 
 # How long a paused (in-progress) quiz session is kept in the DB before expiry.
 # Configurable via env var PAUSED_SESSION_TTL_HOURS (default: 24 hours).
@@ -784,24 +795,15 @@ def build_dynamic_prompt(stats, session_dates, profile):
     )
 
 
-def generate_questions(stats, session_dates, profile):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-    system_prompt = build_system_prompt(profile or {})
-    dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4000,
-        system=system_prompt,
-        messages=[{"role": "user", "content": dynamic_prompt}],
-    )
-    raw = response.content[0].text.strip()
+def _parse_questions(raw: str, provider_name: str) -> list:
+    """Parse and validate JSON questions from AI response."""
     raw = raw.replace("```json", "").replace("```", "").strip()
     try:
         start = raw.index("[")
         end = raw.rindex("]")
         questions = json.loads(raw[start:end+1])
     except (ValueError, json.JSONDecodeError) as e:
-        raise ValueError(f"Не удалось распарсить ответ Claude: {e}\nСырой ответ: {raw[:300]}")
+        raise ValueError(f"Не удалось распарсить ответ {provider_name}: {e}\nСырой ответ: {raw[:300]}")
 
     # Validate correctIndex before shuffle — catches silent scoring bugs
     for i, q in enumerate(questions):
@@ -819,6 +821,42 @@ def generate_questions(stats, session_dates, profile):
         q["correctIndex"] = q["options"].index(correct_text)
 
     return questions
+
+
+def _generate_questions_claude(stats, session_dates, profile):
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    system_prompt = build_system_prompt(profile or {})
+    dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4000,
+        system=system_prompt,
+        messages=[{"role": "user", "content": dynamic_prompt}],
+    )
+    raw = response.content[0].text.strip()
+    return _parse_questions(raw, "Claude")
+
+
+def _generate_questions_openai(stats, session_dates, profile):
+    client = OpenAI(api_key=OPENAI_KEY)
+    system_prompt = build_system_prompt(profile or {})
+    dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
+    response = client.chat.completions.create(
+        model="gpt-5-mini",
+        max_tokens=4000,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": dynamic_prompt},
+        ],
+    )
+    raw = response.choices[0].message.content.strip()
+    return _parse_questions(raw, "GPT-5 mini")
+
+
+def generate_questions(stats, session_dates, profile):
+    if MODEL_PROVIDER == "openai":
+        return _generate_questions_openai(stats, session_dates, profile)
+    return _generate_questions_claude(stats, session_dates, profile)
 
 # ─── Session storage ───────────────────────────────────────────────────────────
 
