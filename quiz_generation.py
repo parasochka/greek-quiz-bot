@@ -2,6 +2,7 @@ import json
 import random
 import time
 import traceback
+import unicodedata
 from datetime import date, datetime
 
 from openai import AsyncOpenAI
