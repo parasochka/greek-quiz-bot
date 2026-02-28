@@ -16,7 +16,7 @@ DATABASE_URL = require_env("DATABASE_URL").replace("postgres://", "postgresql://
 OPENAI_KEY = require_env("OPENAI_API_KEY")
 
 OPENAI_REQUEST_TIMEOUT_SEC = float(os.environ.get("OPENAI_REQUEST_TIMEOUT_SEC", "45"))
-QUIZ_GENERATION_TIMEOUT_SEC = float(os.environ.get("QUIZ_GENERATION_TIMEOUT_SEC", "120"))
+QUIZ_GENERATION_TIMEOUT_SEC = float(os.environ.get("QUIZ_GENERATION_TIMEOUT_SEC", "300"))
 OPENAI_MAX_ATTEMPTS = int(os.environ.get("OPENAI_MAX_ATTEMPTS", "3"))
 OPENAI_TEMPERATURE = float(os.environ.get("OPENAI_TEMPERATURE", "0.55"))
 PAUSED_SESSION_TTL_HOURS = int(os.environ.get("PAUSED_SESSION_TTL_HOURS", "24"))
