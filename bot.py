@@ -7,7 +7,7 @@ import asyncio
 import difflib
 import contextlib
 import asyncpg
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 from telegram.error import Conflict
@@ -460,7 +460,7 @@ async def clear_history(user_id: int):
 async def _save_paused_session(user_id: int, session: dict) -> None:
     """Upsert the current in-progress quiz state to the DB so it survives restarts
     and can be resumed from any device."""
-    expires_at = datetime.utcnow() + timedelta(hours=PAUSED_SESSION_TTL_HOURS)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=PAUSED_SESSION_TTL_HOURS)
     async with _acquire() as conn:
         await conn.execute(
             """
@@ -515,25 +515,25 @@ def calc_streak(session_dates):
     """session_dates: sorted list of YYYY-MM-DD strings."""
     if not session_dates:
         return 0, 0
+
+    parsed_dates = [date.fromisoformat(d) for d in session_dates]
     best = cur = 1
-    for i in range(1, len(session_dates)):
-        diff = (datetime.strptime(session_dates[i], "%Y-%m-%d") -
-                datetime.strptime(session_dates[i-1], "%Y-%m-%d")).days
+    for i in range(1, len(parsed_dates)):
+        diff = (parsed_dates[i] - parsed_dates[i - 1]).days
         if diff == 1:
             cur += 1
             best = max(best, cur)
         elif diff > 1:
             cur = 1
-    today = datetime.now().strftime("%Y-%m-%d")
-    diff = (datetime.strptime(today, "%Y-%m-%d") -
-            datetime.strptime(session_dates[-1], "%Y-%m-%d")).days
+
+    diff = (date.today() - parsed_dates[-1]).days
     current = cur if diff <= 1 else 0
     return current, best
 
 def days_since_last_session(session_dates):
     if not session_dates:
         return 99
-    return (datetime.now() - datetime.strptime(session_dates[-1], "%Y-%m-%d")).days
+    return (date.today() - date.fromisoformat(session_dates[-1])).days
 
 def type_stats_all(history):
     """Per question-type accuracy from full history (used only in /stats display)."""
