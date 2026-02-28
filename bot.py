@@ -8,6 +8,7 @@ import difflib
 import contextlib
 import asyncpg
 from datetime import datetime, date, timedelta, timezone
+from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 from telegram.error import Conflict
@@ -2014,12 +2015,9 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def daily_quiz_reminder(app):
     """Background task: at 18:00 Athens time send quiz reminder to users who haven't played today."""
-    # Athens timezone: UTC+2 (EET winter) / UTC+3 (EEST summer).
-    # Simple approach: use UTC+2 fixed offset as a conservative estimate.
-    ATHENS_OFFSET = timedelta(hours=2)
+    athens_tz = ZoneInfo("Europe/Athens")
     while True:
-        now_utc = datetime.utcnow()
-        now_athens = now_utc + ATHENS_OFFSET
+        now_athens = datetime.now(athens_tz)
         # Next 18:00 Athens
         target_athens = now_athens.replace(hour=18, minute=0, second=0, microsecond=0)
         if now_athens >= target_athens:
@@ -2027,7 +2025,7 @@ async def daily_quiz_reminder(app):
         wait_secs = (target_athens - now_athens).total_seconds()
         await asyncio.sleep(wait_secs)
 
-        today_utc = (datetime.utcnow() + ATHENS_OFFSET).strftime("%Y-%m-%d")
+        today_athens = datetime.now(athens_tz).date()
         try:
             async with _acquire() as conn:
                 users = await conn.fetch("""
@@ -2037,7 +2035,7 @@ async def daily_quiz_reminder(app):
                         SELECT DISTINCT qs.user_id FROM quiz_sessions qs
                         WHERE qs.session_date = $1
                     )
-                """, today_utc)
+                """, today_athens)
             for user in users:
                 try:
                     await app.bot.send_message(
