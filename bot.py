@@ -809,14 +809,20 @@ def _parse_questions(raw: str, provider_name: str) -> list:
     """Parse and validate JSON questions from AI response."""
     raw = raw.replace("```json", "").replace("```", "").strip()
     try:
-        start = raw.index("[")
-        end = raw.rindex("]")
-        questions = json.loads(raw[start:end+1])
+        parsed = json.loads(raw)
     except (ValueError, json.JSONDecodeError) as e:
         raise ValueError(f"Не удалось распарсить ответ {provider_name}: {e}\nСырой ответ: {raw[:300]}")
 
-    if not isinstance(questions, list):
-        raise ValueError(f"{provider_name}: корневой JSON должен быть массивом")
+    if isinstance(parsed, list):
+        questions = parsed
+    elif isinstance(parsed, dict) and isinstance(parsed.get("questions"), list):
+        questions = parsed["questions"]
+    else:
+        raise ValueError(
+            f"{provider_name}: корневой JSON должен быть массивом вопросов "
+            "или объектом с полем 'questions'"
+        )
+
     if len(questions) != 20:
         raise ValueError(f"{provider_name}: ожидается ровно 20 вопросов, получено {len(questions)}")
 
@@ -878,25 +884,32 @@ async def _generate_questions_openai(stats, session_dates, profile):
                 "name": "quiz_questions",
                 "strict": True,
                 "schema": {
-                    "type": "array",
-                    "minItems": 20,
-                    "maxItems": 20,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "required": ["question", "options", "correctIndex", "explanation", "topic", "type"],
-                        "properties": {
-                            "question": {"type": "string"},
-                            "options": {
-                                "type": "array",
-                                "minItems": 4,
-                                "maxItems": 4,
-                                "items": {"type": "string"},
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["questions"],
+                    "properties": {
+                        "questions": {
+                            "type": "array",
+                            "minItems": 20,
+                            "maxItems": 20,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["question", "options", "correctIndex", "explanation", "topic", "type"],
+                                "properties": {
+                                    "question": {"type": "string"},
+                                    "options": {
+                                        "type": "array",
+                                        "minItems": 4,
+                                        "maxItems": 4,
+                                        "items": {"type": "string"},
+                                    },
+                                    "correctIndex": {"type": "integer", "minimum": 0, "maximum": 3},
+                                    "explanation": {"type": "string"},
+                                    "topic": {"type": "string", "enum": MASTER_TOPICS},
+                                    "type": {"type": "string", "enum": list(TYPE_LABELS.keys())},
+                                },
                             },
-                            "correctIndex": {"type": "integer", "minimum": 0, "maximum": 3},
-                            "explanation": {"type": "string"},
-                            "topic": {"type": "string", "enum": MASTER_TOPICS},
-                            "type": {"type": "string", "enum": list(TYPE_LABELS.keys())},
                         },
                     },
                 },
@@ -1190,15 +1203,33 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
         except Exception:
             pass
-        await query.edit_message_reply_markup(reply_markup=None)
+
         # Remove "onb_" prefix then split on the LAST underscore so that
         # keys containing underscores (e.g. "native_lang", "other_langs") are
         # parsed correctly.
         remainder = data[4:]  # strip "onb_"
-        key, _, opt_idx_str = remainder.rpartition("_")
+        key, sep, opt_idx_str = remainder.rpartition("_")
+        if not sep or not key or not opt_idx_str.isdigit():
+            await query.answer("Некорректные данные", show_alert=True)
+            return
+
+        step = next((s for s in ONBOARDING_STEPS if s["key"] == key and s.get("type") == "choice"), None)
+        if not step:
+            await query.answer("Некорректные данные", show_alert=True)
+            return
+
         opt_idx = int(opt_idx_str)
-        step = next(s for s in ONBOARDING_STEPS if s["key"] == key)
-        value = step["options"][opt_idx]
+        options = step.get("options") or []
+        if not (0 <= opt_idx < len(options)):
+            await query.answer("Некорректные данные", show_alert=True)
+            return
+
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        value = options[opt_idx]
         context.user_data.setdefault("onboarding_data", {})[key] = value
         next_step = context.user_data.get("step", 0) + 1
         context.user_data["step"] = next_step
@@ -1268,15 +1299,33 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
         except Exception:
             pass
-        await query.edit_message_reply_markup(reply_markup=None)
+
         # Remove "setopt_" prefix then split on the LAST underscore so that
         # fields containing underscores (e.g. "native_lang", "other_langs")
         # are parsed correctly.
         remainder = data[7:]  # strip "setopt_"
-        field, _, opt_idx_str = remainder.rpartition("_")
+        field, sep, opt_idx_str = remainder.rpartition("_")
+        if not sep or not field or not opt_idx_str.isdigit():
+            await query.answer("Некорректные данные", show_alert=True)
+            return
+
+        step = next((s for s in ONBOARDING_STEPS if s["key"] == field and s.get("type") == "choice"), None)
+        if not step:
+            await query.answer("Некорректные данные", show_alert=True)
+            return
+
         opt_idx = int(opt_idx_str)
-        step = next(s for s in ONBOARDING_STEPS if s["key"] == field)
-        value = step["options"][opt_idx]
+        options = step.get("options") or []
+        if not (0 <= opt_idx < len(options)):
+            await query.answer("Некорректные данные", show_alert=True)
+            return
+
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        value = options[opt_idx]
         await _update_profile_field(user_id, field, value)
         label = PROFILE_FIELD_LABELS.get(field, field)
         await query.message.reply_text(f"✅ Поле «{label}» обновлено: {value}")
