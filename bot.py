@@ -842,13 +842,13 @@ async def _generate_questions_openai(stats, session_dates, profile):
     from openai import AsyncOpenAI
     t0 = time.monotonic()
     print(f"[openai] creating async client …", flush=True)
-    client = AsyncOpenAI(api_key=OPENAI_KEY, timeout=60.0)
+    client = AsyncOpenAI(api_key=OPENAI_KEY, timeout=55.0)
     system_prompt = build_system_prompt(profile or {})
     dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
     print(f"[openai] sending request to gpt-5-mini (prompt ~{len(dynamic_prompt)} chars) …", flush=True)
     response = await client.chat.completions.create(
         model="gpt-5-mini",
-        max_completion_tokens=8000,
+        max_completion_tokens=3000,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": dynamic_prompt},
@@ -1048,7 +1048,7 @@ async def _start_new_quiz(message, user_id):
         t_gen = time.monotonic()
         questions = await asyncio.wait_for(
             generate_questions(stats, session_dates, profile),
-            timeout=90.0,
+            timeout=60.0,
         )
         print(f"[quiz] user={user_id} questions generated in {time.monotonic()-t_gen:.1f}s", flush=True)
 
@@ -1064,9 +1064,9 @@ async def _start_new_quiz(message, user_id):
         await msg.delete()
         await send_question(message, user_id)
     except asyncio.TimeoutError:
-        print(f"[quiz] user={user_id} TIMEOUT: OpenAI did not respond in 90s", flush=True)
+        print(f"[quiz] user={user_id} TIMEOUT: OpenAI did not respond in 60s", flush=True)
         try:
-            await msg.edit_text("❌ OpenAI не ответил за 90 секунд.\n\nПопробуй ещё раз через /quiz")
+            await msg.edit_text("❌ OpenAI не ответил за 60 секунд.\n\nПопробуй ещё раз через /quiz")
         except Exception:
             pass
     except Exception as e:
