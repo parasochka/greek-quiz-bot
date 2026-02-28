@@ -961,22 +961,16 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def start_quiz(message, user_id):
-    # Check for a paused session from a previous run / other device.
+    # Restore a paused session if one exists (survives bot restarts and device switches).
     paused = await _load_paused_session(user_id)
     if paused:
+        user_sessions[user_id] = paused
         answered = paused["current"]
         total = len(paused["questions"])
-        keyboard = [[
-            InlineKeyboardButton("▶️ Продолжить", callback_data="resume_quiz"),
-            InlineKeyboardButton("🔄 Начать заново", callback_data="new_quiz"),
-        ]]
         await message.reply_text(
-            f"⏸ <b>Есть незавершённый квиз</b>\n\n"
-            f"Отвечено {answered} из {total} вопросов.\n"
-            f"Продолжить с того места?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="HTML",
+            f"⏸ Продолжаю незавершённый квиз ({answered} из {total} вопросов пройдено).",
         )
+        await send_question(message, user_id)
         return
 
     await _start_new_quiz(message, user_id)
@@ -1047,34 +1041,6 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Menu ──
     if data.startswith("menu_"):
         await handle_menu(update, context)
-        return
-
-    # ── Resume / restart paused quiz ──
-    if data == "resume_quiz":
-        try:
-            await query.answer()
-        except Exception:
-            pass
-        await query.edit_message_reply_markup(reply_markup=None)
-        paused = await _load_paused_session(user_id)
-        if not paused:
-            await query.message.reply_text("Сохранённый квиз не найден. Начинаю новый...")
-            await _start_new_quiz(query.message, user_id)
-            return
-        user_sessions[user_id] = paused
-        await send_question(query.message, user_id)
-        return
-
-    if data == "new_quiz":
-        try:
-            await query.answer()
-        except Exception:
-            pass
-        await query.edit_message_reply_markup(reply_markup=None)
-        await _delete_paused_session(user_id)
-        if user_id in user_sessions:
-            del user_sessions[user_id]
-        await _start_new_quiz(query.message, user_id)
         return
 
     # ── Onboarding start ──
