@@ -810,6 +810,12 @@ def _parse_questions(raw: str, provider_name: str) -> list:
         if not (0 <= q.get("correctIndex", -1) < len(q.get("options", []))):
             raise ValueError(f"Question {i}: correctIndex={q.get('correctIndex')} out of range")
 
+    # Validate all options are unique within each question — guards against AI returning duplicate choices
+    for i, q in enumerate(questions):
+        opts = q.get("options", [])
+        if len(opts) != len(set(opts)):
+            raise ValueError(f"Question {i}: duplicate options detected: {opts}")
+
     # Normalise topic names — guard against mixed Greek/Cyrillic characters
     for q in questions:
         q["topic"] = normalize_topic(q["topic"])
@@ -873,10 +879,19 @@ async def _generate_questions_openai(stats, session_dates, profile):
 
 
 async def generate_questions(stats, session_dates, profile):
-    if MODEL_PROVIDER == "openai":
-        return await _generate_questions_openai(stats, session_dates, profile)
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _generate_questions_claude, stats, session_dates, profile)
+    last_error = None
+    for attempt in range(3):
+        try:
+            if MODEL_PROVIDER == "openai":
+                return await _generate_questions_openai(stats, session_dates, profile)
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _generate_questions_claude, stats, session_dates, profile)
+        except ValueError as e:
+            last_error = e
+            print(f"[quiz] generation attempt {attempt + 1}/3 failed: {e}", flush=True)
+            if attempt < 2:
+                continue
+    raise last_error
 
 # ─── Session storage ───────────────────────────────────────────────────────────
 
