@@ -988,10 +988,17 @@ async def _repair_questions_openai(client, system_prompt: str, questions: list, 
     ]
     n = len(bad_payload)
     repair_prompt = (
-        "Исправь только проблемные вопросы. Верни ТОЛЬКО JSON-объект с полем questions, "
-        f"в котором ровно {n} новых валидных вопросов в том же порядке, что и список ниже. "
-        "Для каждого вопроса нужно 4 уникальных варианта (без дублей по регистру/пробелам/пунктуации), "
-        "пустые строки запрещены, correctIndex должен соответствовать правильному варианту. "
+        f"Сгенерируй {n} СОВЕРШЕННО НОВЫХ вопросов взамен проблемных. "
+        "Верни ТОЛЬКО JSON-объект с полем questions, "
+        f"в котором ровно {n} новых вопросов в том же порядке, что и список ниже.\n\n"
+        "КРИТИЧЕСКИ ВАЖНО для каждого вопроса:\n"
+        "1. Поле topic должно точно соответствовать теме, указанной в reason (например, если reason говорит "
+        "«topic должен быть \\'Отрицание\\'» — вопрос должен быть ИМЕННО про отрицание в греческом, "
+        "а не просто содержать слово «Отрицание» в поле topic).\n"
+        "2. Содержание вопроса и варианты ответов должны реально проверять знания по указанной теме.\n"
+        "3. Ровно 4 уникальных варианта (без дублей по регистру/пробелам/пунктуации).\n"
+        "4. Пустые строки запрещены, correctIndex должен соответствовать правильному варианту.\n\n"
+        "НЕ исправляй оригинальный вопрос — создай полностью новый на нужную тему.\n\n"
         "Проблемные вопросы:\n"
         f"{json.dumps(bad_payload, ensure_ascii=False)}"
     )
@@ -1145,12 +1152,25 @@ async def _generate_questions_openai(stats, session_dates, profile, required_top
                     )
                     repaired = await _repair_questions_openai(client, system_prompt, parsed, topic_plan_errors)
                     for repl, idx in zip(repaired, sorted(topic_plan_errors)):
-                        repl["topic"] = required_topics[idx]
                         parsed[idx] = repl
                     topic_plan_errors = _collect_topic_plan_errors(parsed, required_topics)
 
                 parsed = _finalize_questions(parsed)
+                topic_summary = ", ".join(
+                    f"{i+1}:{q['topic']}" for i, q in enumerate(parsed)
+                )
                 print(f"[openai] parsed response ok ({len(raw)} chars)", flush=True)
+                print(f"[openai] final topic assignments: {topic_summary}", flush=True)
+                if required_topics:
+                    mismatches = [
+                        f"q{i+1}: expected={required_topics[i]!r} got={parsed[i]['topic']!r}"
+                        for i in range(min(len(parsed), len(required_topics)))
+                        if parsed[i]["topic"] != required_topics[i]
+                    ]
+                    if mismatches:
+                        print(f"[openai] WARNING topic mismatches remain: {'; '.join(mismatches)}", flush=True)
+                    else:
+                        print("[openai] topic plan fully satisfied", flush=True)
                 return parsed
             except ValueError as e:
                 last_error = e
