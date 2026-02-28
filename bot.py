@@ -30,6 +30,7 @@ OPENAI_KEY = _require_env("OPENAI_API_KEY")
 OPENAI_REQUEST_TIMEOUT_SEC = float(os.environ.get("OPENAI_REQUEST_TIMEOUT_SEC", "45"))
 QUIZ_GENERATION_TIMEOUT_SEC = float(os.environ.get("QUIZ_GENERATION_TIMEOUT_SEC", "120"))
 OPENAI_MAX_ATTEMPTS = int(os.environ.get("OPENAI_MAX_ATTEMPTS", "3"))
+OPENAI_TEMPERATURE = float(os.environ.get("OPENAI_TEMPERATURE", "0.3"))
 
 # How long a paused (in-progress) quiz session is kept in the DB before expiry.
 # Configurable via env var PAUSED_SESSION_TTL_HOURS (default: 24 hours).
@@ -811,8 +812,8 @@ def build_dynamic_prompt(stats, session_dates, profile):
     )
 
 
-def _parse_questions(raw: str, provider_name: str) -> list:
-    """Parse and validate JSON questions from AI response."""
+def _extract_questions(raw: str, provider_name: str, expected_count: int = 20) -> list:
+    """Parse AI JSON and return questions array with exact expected_count."""
     raw = raw.replace("```json", "").replace("```", "").strip()
     try:
         parsed = json.loads(raw)
@@ -829,37 +830,61 @@ def _parse_questions(raw: str, provider_name: str) -> list:
             "или объектом с полем 'questions'"
         )
 
-    if len(questions) != 20:
-        raise ValueError(f"{provider_name}: ожидается ровно 20 вопросов, получено {len(questions)}")
+    if len(questions) != expected_count:
+        raise ValueError(f"{provider_name}: ожидается ровно {expected_count} вопросов, получено {len(questions)}")
 
-    # Validate schema before shuffle — catches silent scoring bugs
+    return questions
+
+
+def _collect_question_errors(questions: list) -> dict:
+    """Return {index: reason} for per-question schema/content errors."""
+    errors = {}
+
     for i, q in enumerate(questions):
         if not isinstance(q, dict):
-            raise ValueError(f"Question {i}: объект вопроса должен быть JSON-объектом")
+            errors[i] = "объект вопроса должен быть JSON-объектом"
+            continue
         required = {"question", "options", "correctIndex", "explanation", "topic", "type"}
         if set(q.keys()) != required:
-            raise ValueError(f"Question {i}: неверные поля: {sorted(q.keys())}")
+            errors[i] = f"неверные поля: {sorted(q.keys())}"
+            continue
         if not isinstance(q["question"], str) or not q["question"].strip():
-            raise ValueError(f"Question {i}: поле 'question' должно быть непустой строкой")
+            errors[i] = "поле 'question' должно быть непустой строкой"
+            continue
         if not isinstance(q["explanation"], str) or not q["explanation"].strip():
-            raise ValueError(f"Question {i}: поле 'explanation' должно быть непустой строкой")
+            errors[i] = "поле 'explanation' должно быть непустой строкой"
+            continue
         if q["type"] not in TYPE_LABELS:
-            raise ValueError(f"Question {i}: недопустимый type={q['type']!r}")
+            errors[i] = f"недопустимый type={q['type']!r}"
+            continue
         opts = q.get("options")
         if not isinstance(opts, list) or len(opts) != 4:
-            raise ValueError(f"Question {i}: options должен содержать ровно 4 варианта")
+            errors[i] = "options должен содержать ровно 4 варианта"
+            continue
         if any((not isinstance(o, str) or not o.strip()) for o in opts):
-            raise ValueError(f"Question {i}: каждый вариант в options должен быть непустой строкой")
+            errors[i] = "каждый вариант в options должен быть непустой строкой"
+            continue
         if not isinstance(q.get("correctIndex"), int) or not (0 <= q.get("correctIndex", -1) < len(opts)):
-            raise ValueError(f"Question {i}: correctIndex={q.get('correctIndex')} out of range")
+            errors[i] = f"correctIndex={q.get('correctIndex')} out of range"
+            continue
 
-    # Validate all options are unique within each question — guards against AI returning duplicate choices
-    # (including "near-duplicates" with different casing or extra spaces)
     for i, q in enumerate(questions):
+        if i in errors:
+            continue
         opts = q["options"]
         canonical_opts = [" ".join(o.split()).casefold() for o in opts]
         if len(canonical_opts) != len(set(canonical_opts)):
-            raise ValueError(f"Question {i}: duplicate options detected: {opts}")
+            errors[i] = f"duplicate options detected: {opts}"
+
+    return errors
+
+
+def _finalize_questions(questions: list) -> list:
+    """Normalize topics, enforce validity and shuffle options server-side."""
+    errors = _collect_question_errors(questions)
+    if errors:
+        first_i = min(errors)
+        raise ValueError(f"Question {first_i}: {errors[first_i]}")
 
     # Normalise topic names — guard against mixed Greek/Cyrillic characters
     for q in questions:
@@ -872,6 +897,76 @@ def _parse_questions(raw: str, provider_name: str) -> list:
         q["correctIndex"] = q["options"].index(correct_text)
 
     return questions
+
+
+async def _repair_questions_openai(client, system_prompt: str, questions: list, invalid: dict) -> list:
+    """Regenerate only invalid question slots and return same-length replacement list."""
+    bad_payload = [
+        {
+            "index": idx,
+            "reason": reason,
+            "original": questions[idx],
+        }
+        for idx, reason in sorted(invalid.items())
+    ]
+    n = len(bad_payload)
+    repair_prompt = (
+        "Исправь только проблемные вопросы. Верни ТОЛЬКО JSON-объект с полем questions, "
+        f"в котором ровно {n} новых валидных вопросов в том же порядке, что и список ниже. "
+        "Для каждого вопроса нужно 4 уникальных варианта (без дублей по регистру/пробелам/пунктуации), "
+        "пустые строки запрещены, correctIndex должен соответствовать правильному варианту. "
+        "Проблемные вопросы:\n"
+        f"{json.dumps(bad_payload, ensure_ascii=False)}"
+    )
+
+    response = await client.chat.completions.create(
+        model="gpt-4.1-mini",
+        max_tokens=1800,
+        temperature=OPENAI_TEMPERATURE,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "quiz_question_repairs",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["questions"],
+                    "properties": {
+                        "questions": {
+                            "type": "array",
+                            "minItems": n,
+                            "maxItems": n,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["question", "options", "correctIndex", "explanation", "topic", "type"],
+                                "properties": {
+                                    "question": {"type": "string"},
+                                    "options": {
+                                        "type": "array",
+                                        "minItems": 4,
+                                        "maxItems": 4,
+                                        "items": {"type": "string"},
+                                    },
+                                    "correctIndex": {"type": "integer", "minimum": 0, "maximum": 3},
+                                    "explanation": {"type": "string"},
+                                    "topic": {"type": "string", "enum": MASTER_TOPICS},
+                                    "type": {"type": "string", "enum": list(TYPE_LABELS.keys())},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": repair_prompt},
+        ],
+    )
+    raw = (response.choices[0].message.content or "").strip()
+    return _extract_questions(raw, "gpt-4.1-mini repair", expected_count=n)
 
 
 async def _generate_questions_openai(stats, session_dates, profile):
@@ -894,7 +989,7 @@ async def _generate_questions_openai(stats, session_dates, profile):
         response = await client.chat.completions.create(
             model="gpt-4.1-mini",
             max_tokens=4500,
-            temperature=0.2,
+            temperature=OPENAI_TEMPERATURE,
             response_format={
                 "type": "json_schema",
                 "json_schema": {
@@ -949,7 +1044,22 @@ async def _generate_questions_openai(stats, session_dates, profile):
             last_error = ValueError(f"gpt-4.1-mini вернул пустой ответ (finish_reason={finish!r})")
         else:
             try:
-                parsed = _parse_questions(raw, "gpt-4.1-mini")
+                parsed = _extract_questions(raw, "gpt-4.1-mini")
+
+                # Fast path: repair only broken question slots instead of full-regenerating all 20.
+                for repair_round in range(1, 3):
+                    errors = _collect_question_errors(parsed)
+                    if not errors:
+                        break
+                    print(
+                        f"[openai] attempting targeted repair round {repair_round}: {len(errors)} invalid question(s)",
+                        flush=True,
+                    )
+                    repaired = await _repair_questions_openai(client, system_prompt, parsed, errors)
+                    for repl, idx in zip(repaired, sorted(errors)):
+                        parsed[idx] = repl
+
+                parsed = _finalize_questions(parsed)
                 print(f"[openai] parsed response ok ({len(raw)} chars)", flush=True)
                 return parsed
             except ValueError as e:
