@@ -849,7 +849,11 @@ def _generate_questions_openai(stats, session_dates, profile):
             {"role": "user", "content": dynamic_prompt},
         ],
     )
-    raw = response.choices[0].message.content.strip()
+    choice = response.choices[0]
+    raw = (choice.message.content or "").strip()
+    if not raw:
+        finish = choice.finish_reason
+        raise ValueError(f"GPT-5 mini вернул пустой ответ (finish_reason={finish!r})")
     return _parse_questions(raw, "GPT-5 mini")
 
 
