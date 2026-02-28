@@ -167,6 +167,17 @@ async def init_db():
                 PRIMARY KEY (user_id, topic)
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_events (
+                id         SERIAL PRIMARY KEY,
+                level      VARCHAR(16) NOT NULL,
+                event_type VARCHAR(64) NOT NULL,
+                message    TEXT NOT NULL,
+                details    TEXT,
+                user_id    BIGINT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
 
 
 async def register_user(user):
@@ -493,6 +504,58 @@ async def _admin_list_users_with_quiz_counts():
             GROUP BY u.telegram_id, u.username, u.first_name
             ORDER BY quiz_count DESC, u.first_name NULLS LAST, u.username NULLS LAST
             """
+        )
+    return rows
+
+
+async def log_admin_event(level: str, event_type: str, message: str, details: str = "", user_id: int | None = None):
+    payload = f"[{level}/{event_type}] {message}"
+    if details:
+        payload += f" | {details[:300]}"
+    print(payload)
+
+    if db_pool is None:
+        return
+
+    try:
+        async with _acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO admin_events (level, event_type, message, details, user_id)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                level[:16], event_type[:64], message[:1000], (details or "")[:4000], user_id,
+            )
+    except Exception as e:
+        print(f"[WARN/admin_events] failed to persist event: {e}")
+
+
+async def _admin_health_snapshot():
+    async with _acquire() as conn:
+        users_total = await conn.fetchval("SELECT COUNT(*) FROM users")
+        users_onboarded = await conn.fetchval("SELECT COUNT(*) FROM users WHERE onboarding_complete = TRUE")
+        quizzes_today = await conn.fetchval("SELECT COUNT(*) FROM quiz_sessions WHERE session_date = CURRENT_DATE")
+        active_paused = await conn.fetchval("SELECT COUNT(*) FROM paused_sessions WHERE expires_at > NOW()")
+        last_quiz_at = await conn.fetchval("SELECT MAX(completed_at) FROM quiz_sessions")
+    return {
+        "users_total": users_total or 0,
+        "users_onboarded": users_onboarded or 0,
+        "quizzes_today": quizzes_today or 0,
+        "active_paused": active_paused or 0,
+        "last_quiz_at": last_quiz_at,
+    }
+
+
+async def _admin_recent_events(limit: int = 8):
+    async with _acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT level, event_type, message, details, user_id, created_at
+            FROM admin_events
+            ORDER BY created_at DESC
+            LIMIT $1
+            """,
+            limit,
         )
     return rows
 
@@ -1303,7 +1366,10 @@ async def send_about_message(message):
 
 
 async def show_admin_menu(message):
-    keyboard = [[InlineKeyboardButton("📈 Статистика пользователей", callback_data="admin_user_stats")]]
+    keyboard = [
+        [InlineKeyboardButton("📈 Статистика пользователей", callback_data="admin_user_stats")],
+        [InlineKeyboardButton("🚨 Логи и здоровье", callback_data="admin_logs")],
+    ]
     await message.reply_text("🛠 <b>Админка</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
 
@@ -1326,6 +1392,34 @@ async def show_admin_user_stats(message):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML",
     )
+
+
+async def show_admin_logs(message):
+    health = await _admin_health_snapshot()
+    events = await _admin_recent_events()
+
+    lines = [
+        "🚨 <b>Критичные логи и здоровье</b>",
+        "",
+        f"👥 Пользователей: <b>{health['users_total']}</b> (с анкетой: {health['users_onboarded']})",
+        f"📘 Квизов сегодня: <b>{health['quizzes_today']}</b>",
+        f"⏸ Активных пауз квиза: <b>{health['active_paused']}</b>",
+        f"🕒 Последний завершённый квиз: <b>{health['last_quiz_at'] or '—'}</b>",
+        "",
+        "<b>Последние события:</b>",
+    ]
+
+    if not events:
+        lines.append("— пока нет событий —")
+    else:
+        for row in events:
+            ts = row["created_at"].strftime("%d.%m %H:%M")
+            uid = f" uid={row['user_id']}" if row["user_id"] else ""
+            details = (row["details"] or "").strip()
+            details_short = f" | {h(details[:120])}" if details else ""
+            lines.append(f"• [{ts}] <b>{h(row['level'])}</b> {h(row['event_type'])}{uid}: {h(row['message'])}{details_short}")
+
+    await message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1722,6 +1816,17 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("⛔ Доступ запрещён.")
             return
         await show_admin_user_stats(query.message)
+        return
+
+    if data == "admin_logs":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not is_owner(query.from_user):
+            await query.message.reply_text("⛔ Доступ запрещён.")
+            return
+        await show_admin_logs(query.message)
         return
 
     if data.startswith("admin_reset_confirm_"):
@@ -2260,33 +2365,37 @@ async def settings_menu(message):
 _bot_start_time = datetime.now()
 _conflict_count = 0
 
-async def conflict_error_handler(update, context):
-    """Handle Conflict errors that arise when two bot instances run simultaneously.
-
-    Strategy:
-    - NEW instance  (uptime < 30 s): back off and retry — the old container is
-      still alive but Railway will kill it shortly via SIGTERM.
-    - OLD instance  (uptime ≥ 30 s): we were running fine and a new deployment
-      just stole our getUpdates slot.  Send ourselves SIGTERM so run_polling's
-      built-in signal handler shuts us down cleanly and the new instance wins.
-    """
+async def global_error_handler(update, context):
+    """Capture conflicts + unhandled exceptions and persist admin-facing logs."""
     global _conflict_count
-    if not isinstance(context.error, Conflict):
-        _conflict_count = 0
-        raise context.error
 
-    _conflict_count += 1
-    uptime_s = (datetime.now() - _bot_start_time).total_seconds()
+    if isinstance(context.error, Conflict):
+        _conflict_count += 1
+        uptime_s = (datetime.now() - _bot_start_time).total_seconds()
 
-    if uptime_s > 30:
-        print(f"[WARN] Conflict after {uptime_s:.0f}s uptime — new deployment detected, "
-              f"shutting down this instance to yield to the new one.")
-        os.kill(os.getpid(), signal.SIGTERM)
+        if uptime_s > 30:
+            msg = (
+                f"Conflict after {uptime_s:.0f}s uptime — new deployment detected, "
+                "shutting down this instance."
+            )
+            await log_admin_event("WARN", "telegram_conflict", msg)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
+
+        wait = min(5 * _conflict_count, 30)
+        await log_admin_event("WARN", "telegram_conflict", f"Conflict at startup, backoff {wait}s")
+        await asyncio.sleep(wait)
         return
 
-    wait = min(5 * _conflict_count, 30)
-    print(f"[WARN] Conflict at startup (attempt {_conflict_count}), backing off {wait}s …")
-    await asyncio.sleep(wait)
+    _conflict_count = 0
+    update_type = type(update).__name__ if update is not None else "none"
+    tb = "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
+    await log_admin_event(
+        "ERROR",
+        "handler_exception",
+        f"Unhandled exception in update={update_type}: {context.error}",
+        details=tb,
+    )
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_access_allowed(update.effective_user):
@@ -2343,15 +2452,18 @@ async def daily_quiz_reminder(app):
                     )
                     await asyncio.sleep(0.05)
                 except Exception as e:
-                    print(f"[reminder] failed for {user['telegram_id']}: {e}")
+                    await log_admin_event(
+                        "WARN", "reminder_send_failed", f"Failed reminder delivery: {e}", user_id=user["telegram_id"],
+                    )
         except Exception as e:
-            print(f"[reminder] DB error: {e}")
+            await log_admin_event("ERROR", "reminder_db_error", f"Reminder DB error: {e}")
 
 
 async def post_init(app):
     # Delete any stale webhook so polling can start without a Conflict right away.
     await app.bot.delete_webhook(drop_pending_updates=True)
     await init_db()
+    await log_admin_event("INFO", "startup", "Bot started and DB initialized")
     asyncio.create_task(daily_quiz_reminder(app))
     await app.bot.set_my_commands([
         BotCommand("start",    "Главное меню"),
@@ -2374,7 +2486,7 @@ def main():
     app.add_handler(CommandHandler("reset",    reset_command))
     app.add_handler(CallbackQueryHandler(handle_answer))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-    app.add_error_handler(conflict_error_handler)
+    app.add_error_handler(global_error_handler)
     app.run_polling(drop_pending_updates=True, poll_interval=1)
 
 if __name__ == "__main__":
