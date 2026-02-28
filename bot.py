@@ -11,7 +11,7 @@ from datetime import datetime, date, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 from telegram.error import Conflict
-import anthropic
+from openai import AsyncOpenAI
 
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
@@ -25,16 +25,8 @@ def _require_env(name: str) -> str:
 TG_TOKEN = _require_env("TELEGRAM_TOKEN")
 DATABASE_URL = _require_env("DATABASE_URL").replace("postgres://", "postgresql://", 1)
 
-# MODEL_PROVIDER: "claude" (default) or "openai"
-# Set MODEL_PROVIDER=openai and OPENAI_API_KEY to switch to gpt-4.1-mini.
-MODEL_PROVIDER = os.environ.get("MODEL_PROVIDER", "claude")
-
-if MODEL_PROVIDER == "openai":
-    OPENAI_KEY = _require_env("OPENAI_API_KEY")
-    ANTHROPIC_KEY = None
-else:
-    ANTHROPIC_KEY = _require_env("ANTHROPIC_API_KEY")
-    OPENAI_KEY = None
+# The bot now uses only ChatGPT API for quiz generation.
+OPENAI_KEY = _require_env("OPENAI_API_KEY")
 
 # How long a paused (in-progress) quiz session is kept in the DB before expiry.
 # Configurable via env var PAUSED_SESSION_TTL_HOURS (default: 24 hours).
@@ -103,7 +95,7 @@ MAIN_MENU_KEYBOARD = [
 ]
 
 # Canonical topic names — used to detect unseen topics and enforce consistent Stats keys.
-# Claude is instructed to use EXACTLY these strings in the "topic" field of each question.
+# ChatGPT is instructed to use EXACTLY these strings in the "topic" field of each question.
 MASTER_TOPICS = [
     "Глаголы",
     "Прошедшее время",
@@ -132,7 +124,7 @@ MASTER_TOPICS = [
 def normalize_topic(topic: str) -> str:
     """Map API-returned topic to the nearest canonical MASTER_TOPICS name.
 
-    Claude occasionally mixes in visually similar Greek characters (e.g. ο, ι, Και)
+    The model may occasionally mix in visually similar Greek characters (e.g. ο, ι, Και)
     inside otherwise-Cyrillic topic names. difflib finds the closest match so
     statistics are always recorded under the correct canonical key.
     """
@@ -556,7 +548,7 @@ def type_stats_all(history):
             stats[qt]["correct"] += 1
     return stats
 
-# ─── Claude prompt ─────────────────────────────────────────────────────────────
+# ─── AI prompt ─────────────────────────────────────────────────────────────────
 
 PROMPT_STATIC = """КРИТИЧЕСКИ ВАЖНО:
 - Только стандартный современный греческий язык (νέα ελληνική γλώσσα).
@@ -761,7 +753,7 @@ def build_dynamic_prompt(stats, session_dates, profile):
 
     hist_summary = "\n".join(hist_lines) if hist_lines else "  (история пуста — первая сессия)"
 
-    # Unseen topics — explicitly listed so Claude knows exactly what hasn't been practiced
+    # Unseen topics — explicitly listed so the model knows exactly what hasn't been practiced
     unseen = [t for t in MASTER_TOPICS if t not in stats or stats[t]["total"] == 0]
     if unseen:
         hist_summary += (
@@ -868,37 +860,8 @@ def _parse_questions(raw: str, provider_name: str) -> list:
     return questions
 
 
-def _generate_questions_claude(stats, session_dates, profile):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-    system_prompt = build_system_prompt(profile or {})
-    dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
-    repair_note = ""
-
-    for attempt in range(1, 4):
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=6000,
-            temperature=0.3,
-            system=system_prompt,
-            messages=[{"role": "user", "content": dynamic_prompt + repair_note}],
-        )
-        raw = response.content[0].text.strip()
-        try:
-            return _parse_questions(raw, "Claude")
-        except ValueError as e:
-            if attempt == 3:
-                raise
-            repair_note = (
-                "\n\nПРЕДЫДУЩИЙ ОТВЕТ НЕ ПРОШЁЛ ВАЛИДАЦИЮ. "
-                f"Ошибка: {e}. Сгенерируй заново С НУЛЯ и верни только корректный JSON-массив."
-            )
-
-    raise ValueError("Claude: не удалось сгенерировать валидный квиз после 3 попыток")
-
-
 async def _generate_questions_openai(stats, session_dates, profile):
     import time
-    from openai import AsyncOpenAI
     t0 = time.monotonic()
     print(f"[openai] creating async client …", flush=True)
     client = AsyncOpenAI(api_key=OPENAI_KEY, timeout=55.0)
@@ -955,10 +918,7 @@ async def _generate_questions_openai(stats, session_dates, profile):
 
 
 async def generate_questions(stats, session_dates, profile):
-    if MODEL_PROVIDER == "openai":
-        return await _generate_questions_openai(stats, session_dates, profile)
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _generate_questions_claude, stats, session_dates, profile)
+    return await _generate_questions_openai(stats, session_dates, profile)
 
 # ─── Session storage ───────────────────────────────────────────────────────────
 
@@ -1484,7 +1444,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Acknowledge the callback query immediately — Telegram requires this within 10 seconds.
-    # All subsequent work (edit, reply, Claude API) can take much longer.
+    # All subsequent work (edit, reply, ChatGPT API) can take much longer.
     try:
         await query.answer()
     except Exception:
