@@ -1039,8 +1039,9 @@ def _collect_question_errors(questions: list) -> dict:
     errors = {}
 
     def canonicalize_option(option: str) -> str:
-        normalized = unicodedata.normalize("NFKD", option)
-        normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+        # Keep diacritics: in Greek they can distinguish valid forms (e.g. παιδιά vs παιδία),
+        # and stripping them causes false-positive duplicate detection.
+        normalized = unicodedata.normalize("NFC", option)
         normalized = "".join(ch for ch in normalized if not unicodedata.category(ch).startswith("P"))
         normalized = " ".join(normalized.split())
         return normalized.casefold()
