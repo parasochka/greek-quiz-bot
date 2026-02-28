@@ -661,7 +661,8 @@ PROMPT_STATIC = """КРИТИЧЕСКИ ВАЖНО:
 - Объясни конкретное правило. 1-2 предложения.
 
 Варианты ответа должны быть перемешаны случайным образом — correctIndex указывает реальную позицию правильного варианта.
-Неправильные варианты — правдоподобные: похожие формы, близкие слова, частые ошибки."""
+Неправильные варианты — правдоподобные: похожие формы, близкие слова, частые ошибки.
+ОБЯЗАТЕЛЬНО: все 4 варианта в каждом вопросе должны быть разными строками — никаких повторений внутри одного вопроса."""
 
 
 def build_profile_section(profile: dict) -> str:
@@ -809,6 +810,12 @@ def _parse_questions(raw: str, provider_name: str) -> list:
     for i, q in enumerate(questions):
         if not (0 <= q.get("correctIndex", -1) < len(q.get("options", []))):
             raise ValueError(f"Question {i}: correctIndex={q.get('correctIndex')} out of range")
+
+    # Validate all options are unique within each question — guards against AI returning duplicate choices
+    for i, q in enumerate(questions):
+        opts = q.get("options", [])
+        if len(opts) != len(set(opts)):
+            raise ValueError(f"Question {i}: duplicate options detected: {opts}")
 
     # Normalise topic names — guard against mixed Greek/Cyrillic characters
     for q in questions:
