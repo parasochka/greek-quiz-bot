@@ -6,6 +6,7 @@ import random
 import asyncio
 import difflib
 import contextlib
+import unicodedata
 import asyncpg
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -1037,6 +1038,13 @@ def _collect_question_errors(questions: list) -> dict:
     """Return {index: reason} for per-question schema/content errors."""
     errors = {}
 
+    def canonicalize_option(option: str) -> str:
+        normalized = unicodedata.normalize("NFKD", option)
+        normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+        normalized = "".join(ch for ch in normalized if not unicodedata.category(ch).startswith("P"))
+        normalized = " ".join(normalized.split())
+        return normalized.casefold()
+
     for i, q in enumerate(questions):
         if not isinstance(q, dict):
             errors[i] = "объект вопроса должен быть JSON-объектом"
@@ -1069,7 +1077,7 @@ def _collect_question_errors(questions: list) -> dict:
         if i in errors:
             continue
         opts = q["options"]
-        canonical_opts = [" ".join(o.split()).casefold() for o in opts]
+        canonical_opts = [canonicalize_option(o) for o in opts]
         if len(canonical_opts) != len(set(canonical_opts)):
             errors[i] = f"duplicate options detected: {opts}"
 
