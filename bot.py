@@ -12,7 +12,6 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotComm
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 from telegram.error import Conflict
 import anthropic
-from openai import OpenAI
 
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
@@ -671,6 +670,15 @@ PROMPT_STATIC = """КРИТИЧЕСКИ ВАЖНО:
 • options — массив ровно из 4 строк.
 • correctIndex — целое число: 0, 1, 2 или 3.
 • Никакого текста вне JSON-массива, никаких ```json``` обёрток, никаких комментариев.
+• Каждый question, option и explanation должен быть обычной JSON-строкой (без необработанных переносов строк, без служебных комментариев).
+
+Перед отправкой ответа сделай САМОПРОВЕРКУ:
+1) В массиве ровно 20 объектов.
+2) В каждом объекте ровно 6 нужных полей.
+3) В каждом объекте options содержит ровно 4 УНИКАЛЬНЫЕ строки.
+4) correctIndex указывает именно на правильный вариант.
+5) topic входит в фиксированный список, type входит в: ru_to_gr, gr_to_ru, choose_form, fill_blank.
+6) Выводишь ТОЛЬКО JSON-массив, без префиксов/суффиксов.
 Вся творческая свобода — в тексте: живые и неожиданные ситуации, яркие сценарии, богатые объяснения."""
 
 
@@ -815,14 +823,35 @@ def _parse_questions(raw: str, provider_name: str) -> list:
     except (ValueError, json.JSONDecodeError) as e:
         raise ValueError(f"Не удалось распарсить ответ {provider_name}: {e}\nСырой ответ: {raw[:300]}")
 
-    # Validate correctIndex before shuffle — catches silent scoring bugs
+    if not isinstance(questions, list):
+        raise ValueError(f"{provider_name}: корневой JSON должен быть массивом")
+    if len(questions) != 20:
+        raise ValueError(f"{provider_name}: ожидается ровно 20 вопросов, получено {len(questions)}")
+
+    # Validate schema before shuffle — catches silent scoring bugs
     for i, q in enumerate(questions):
-        if not (0 <= q.get("correctIndex", -1) < len(q.get("options", []))):
+        if not isinstance(q, dict):
+            raise ValueError(f"Question {i}: объект вопроса должен быть JSON-объектом")
+        required = {"question", "options", "correctIndex", "explanation", "topic", "type"}
+        if set(q.keys()) != required:
+            raise ValueError(f"Question {i}: неверные поля: {sorted(q.keys())}")
+        if not isinstance(q["question"], str) or not q["question"].strip():
+            raise ValueError(f"Question {i}: поле 'question' должно быть непустой строкой")
+        if not isinstance(q["explanation"], str) or not q["explanation"].strip():
+            raise ValueError(f"Question {i}: поле 'explanation' должно быть непустой строкой")
+        if q["type"] not in TYPE_LABELS:
+            raise ValueError(f"Question {i}: недопустимый type={q['type']!r}")
+        opts = q.get("options")
+        if not isinstance(opts, list) or len(opts) != 4:
+            raise ValueError(f"Question {i}: options должен содержать ровно 4 варианта")
+        if any((not isinstance(o, str) or not o.strip()) for o in opts):
+            raise ValueError(f"Question {i}: каждый вариант в options должен быть непустой строкой")
+        if not isinstance(q.get("correctIndex"), int) or not (0 <= q.get("correctIndex", -1) < len(opts)):
             raise ValueError(f"Question {i}: correctIndex={q.get('correctIndex')} out of range")
 
     # Validate all options are unique within each question — guards against AI returning duplicate choices
     for i, q in enumerate(questions):
-        opts = q.get("options", [])
+        opts = q["options"]
         if len(opts) != len(set(opts)):
             raise ValueError(f"Question {i}: duplicate options detected: {opts}")
 
@@ -843,15 +872,28 @@ def _generate_questions_claude(stats, session_dates, profile):
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     system_prompt = build_system_prompt(profile or {})
     dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=6000,
-        temperature=0.3,
-        system=system_prompt,
-        messages=[{"role": "user", "content": dynamic_prompt}],
-    )
-    raw = response.content[0].text.strip()
-    return _parse_questions(raw, "Claude")
+    repair_note = ""
+
+    for attempt in range(1, 4):
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=6000,
+            temperature=0.3,
+            system=system_prompt,
+            messages=[{"role": "user", "content": dynamic_prompt + repair_note}],
+        )
+        raw = response.content[0].text.strip()
+        try:
+            return _parse_questions(raw, "Claude")
+        except ValueError as e:
+            if attempt == 3:
+                raise
+            repair_note = (
+                "\n\nПРЕДЫДУЩИЙ ОТВЕТ НЕ ПРОШЁЛ ВАЛИДАЦИЮ. "
+                f"Ошибка: {e}. Сгенерируй заново С НУЛЯ и верни только корректный JSON-массив."
+            )
+
+    raise ValueError("Claude: не удалось сгенерировать валидный квиз после 3 попыток")
 
 
 async def _generate_questions_openai(stats, session_dates, profile):
@@ -862,31 +904,54 @@ async def _generate_questions_openai(stats, session_dates, profile):
     client = AsyncOpenAI(api_key=OPENAI_KEY, timeout=55.0)
     system_prompt = build_system_prompt(profile or {})
     dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
-    print(f"[openai] sending request to gpt-4.1-mini (prompt ~{len(dynamic_prompt)} chars) …", flush=True)
-    response = await client.chat.completions.create(
-        model="gpt-4.1-mini",
-        max_tokens=6000,
-        temperature=0.3,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": dynamic_prompt},
-        ],
-    )
-    elapsed = time.monotonic() - t0
-    print(f"[openai] response received in {elapsed:.1f}s", flush=True)
-    choice = response.choices[0]
-    finish = choice.finish_reason
-    raw = (choice.message.content or "").strip()
-    print(f"[openai] finish_reason={finish!r}, content length={len(raw)} chars", flush=True)
-    if finish == "length":
-        raise ValueError(
-            f"gpt-4.1-mini обрезал ответ по лимиту токенов (finish_reason='length'). "
-            f"Первые 300 символов: {raw[:300]}"
+    repair_note = ""
+    for attempt in range(1, 4):
+        prompt = dynamic_prompt + repair_note
+        print(f"[openai] sending request to gpt-4.1-mini (attempt {attempt}, prompt ~{len(prompt)} chars) …", flush=True)
+        response = await client.chat.completions.create(
+            model="gpt-4.1-mini",
+            max_tokens=6000,
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
         )
-    if not raw:
-        raise ValueError(f"gpt-4.1-mini вернул пустой ответ (finish_reason={finish!r})")
-    print(f"[openai] parsed response ok ({len(raw)} chars)", flush=True)
-    return _parse_questions(raw, "gpt-4.1-mini")
+        elapsed = time.monotonic() - t0
+        print(f"[openai] response received in {elapsed:.1f}s", flush=True)
+        choice = response.choices[0]
+        finish = choice.finish_reason
+        raw = (choice.message.content or "").strip()
+        print(f"[openai] finish_reason={finish!r}, content length={len(raw)} chars", flush=True)
+        if finish == "length":
+            if attempt == 3:
+                raise ValueError(
+                    f"gpt-4.1-mini обрезал ответ по лимиту токенов (finish_reason='length'). "
+                    f"Первые 300 символов: {raw[:300]}"
+                )
+            repair_note = (
+                "\n\nПРЕДЫДУЩИЙ ОТВЕТ БЫЛ ОБРЕЗАН ПО ЛИМИТУ ТОКЕНОВ. "
+                "Сгенерируй заново строго компактный JSON-массив из 20 объектов и ничего больше."
+            )
+            continue
+        if not raw:
+            if attempt == 3:
+                raise ValueError(f"gpt-4.1-mini вернул пустой ответ (finish_reason={finish!r})")
+            repair_note = "\n\nПРЕДЫДУЩИЙ ОТВЕТ ПУСТОЙ. Верни корректный JSON-массив из 20 объектов."
+            continue
+        try:
+            parsed = _parse_questions(raw, "gpt-4.1-mini")
+            print(f"[openai] parsed response ok ({len(raw)} chars)", flush=True)
+            return parsed
+        except ValueError as e:
+            if attempt == 3:
+                raise
+            repair_note = (
+                "\n\nПРЕДЫДУЩИЙ ОТВЕТ НЕ ПРОШЁЛ ВАЛИДАЦИЮ. "
+                f"Ошибка: {e}. Сгенерируй заново С НУЛЯ и верни только корректный JSON-массив."
+            )
+
+    raise ValueError("gpt-4.1-mini: не удалось сгенерировать валидный квиз после 3 попыток")
 
 
 async def generate_questions(stats, session_dates, profile):
