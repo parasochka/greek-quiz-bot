@@ -97,6 +97,12 @@ PROMPT_STATIC = """КРИТИЧЕСКИ ВАЖНО:
 3. choose_form — выбор правильной формы в предложении-ситуации: "Ты говоришь другу, кого видишь у Агоры: «Βλέπω ___ (красивая женщина).»" — 4 варианта с разными формами
 4. fill_blank — вставить слово в диалог или фразу из ситуации: "Сосед спрашивает где ты живёшь. Ты отвечаешь: «Εγώ ___ στη Λεμεσό.»" — 4 варианта на греческом
 
+КРИТИЧЕСКОЕ УТОЧНЕНИЕ ДЛЯ choose_form И fill_blank:
+- Эти вопросы должны быть формата «вставь ОДНО слово или короткую форму в ___».
+- В question обязательно должен быть пропуск "___" внутри греческого предложения.
+- options для этих типов — только короткие вставки (обычно 1 слово, максимум 2-3 коротких токена), а не полные предложения.
+- Не используй формулировку «Выбери правильный ответ» без пропуска: задача должна быть именно про вставку в пустое место.
+
 Выбор типа вопроса по теме:
 - Темы-словарь (Время и дата, Еда и продукты, Семья, Части тела, Погода, Одежда, Дом и квартира, Бытовые ситуации):
   предпочитай ru_to_gr и gr_to_ru — проверяй знание слов и выражений
@@ -349,6 +355,16 @@ def _collect_question_errors(questions: list) -> dict:
         normalized = " ".join(normalized.split())
         return normalized.casefold()
 
+    def is_short_insert(option: str) -> bool:
+        stripped = option.strip()
+        if not stripped:
+            return False
+        if len(stripped) > 28:
+            return False
+        if any(mark in stripped for mark in ".!?;:"):
+            return False
+        return len(stripped.split()) <= 3
+
     for i, q in enumerate(questions):
         if not isinstance(q, dict):
             errors[i] = "объект вопроса должен быть JSON-объектом"
@@ -379,6 +395,13 @@ def _collect_question_errors(questions: list) -> dict:
         if not isinstance(q.get("correctIndex"), int) or not (0 <= q.get("correctIndex", -1) < len(opts)):
             errors[i] = f"correctIndex={q.get('correctIndex')} out of range"
             continue
+        if q["type"] in {"choose_form", "fill_blank"}:
+            if "___" not in q["question"]:
+                errors[i] = "для choose_form/fill_blank в question обязателен пропуск '___'"
+                continue
+            if not all(is_short_insert(o) for o in opts):
+                errors[i] = "для choose_form/fill_blank варианты должны быть короткими вставками, а не целыми предложениями"
+                continue
 
     for i, q in enumerate(questions):
         if i in errors:
