@@ -26,6 +26,10 @@ ANTHROPIC_KEY = _require_env("ANTHROPIC_API_KEY")
 TG_TOKEN = _require_env("TELEGRAM_TOKEN")
 DATABASE_URL = _require_env("DATABASE_URL").replace("postgres://", "postgresql://", 1)
 
+# How long a paused (in-progress) quiz session is kept in the DB before expiry.
+# Configurable via env var PAUSED_SESSION_TTL_HOURS (default: 24 hours).
+PAUSED_SESSION_TTL_HOURS = int(os.environ.get("PAUSED_SESSION_TTL_HOURS", "24"))
+
 db_pool = None
 
 
@@ -206,6 +210,17 @@ async def init_db():
                 total     INT  DEFAULT 0,
                 last_seen DATE,
                 PRIMARY KEY (user_id, topic)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS paused_sessions (
+                user_id       BIGINT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
+                questions     JSONB NOT NULL,
+                current_idx   INT NOT NULL DEFAULT 0,
+                answers       JSONB NOT NULL DEFAULT '[]',
+                session_dates JSONB NOT NULL DEFAULT '[]',
+                updated_at    TIMESTAMPTZ DEFAULT NOW(),
+                expires_at    TIMESTAMPTZ NOT NULL
             )
         """)
 
@@ -415,7 +430,8 @@ async def _save_all(user_id: int, answers: list):
 
 async def _clear_all(user_id: int):
     """
-    Wipe answers, quiz_sessions, topic_stats for this user. Returns number of answers deleted.
+    Wipe answers, quiz_sessions, topic_stats, and any paused session for this user.
+    Returns number of answers deleted.
     """
     async with _acquire() as conn:
         async with conn.transaction():
@@ -425,6 +441,7 @@ async def _clear_all(user_id: int):
             await conn.execute("DELETE FROM answers WHERE user_id=$1", user_id)
             await conn.execute("DELETE FROM quiz_sessions WHERE user_id=$1", user_id)
             await conn.execute("DELETE FROM topic_stats WHERE user_id=$1", user_id)
+            await conn.execute("DELETE FROM paused_sessions WHERE user_id=$1", user_id)
             return count
 
 
@@ -434,6 +451,61 @@ async def save_result(user_id: int, answers: list):
 
 async def clear_history(user_id: int):
     return await _clear_all(user_id)
+
+
+# ─── Paused-session persistence (cross-device / bot-restart resume) ─────────────
+
+async def _save_paused_session(user_id: int, session: dict) -> None:
+    """Upsert the current in-progress quiz state to the DB so it survives restarts
+    and can be resumed from any device."""
+    expires_at = datetime.utcnow() + timedelta(hours=PAUSED_SESSION_TTL_HOURS)
+    async with _acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO paused_sessions (user_id, questions, current_idx, answers, session_dates, updated_at, expires_at)
+            VALUES ($1, $2::jsonb, $3, $4::jsonb, $5::jsonb, NOW(), $6)
+            ON CONFLICT (user_id) DO UPDATE SET
+                questions     = EXCLUDED.questions,
+                current_idx   = EXCLUDED.current_idx,
+                answers       = EXCLUDED.answers,
+                session_dates = EXCLUDED.session_dates,
+                updated_at    = NOW(),
+                expires_at    = EXCLUDED.expires_at
+            """,
+            user_id,
+            json.dumps(session["questions"]),
+            session["current"],
+            json.dumps(session["answers"]),
+            json.dumps(session["session_dates"]),
+            expires_at,
+        )
+
+
+async def _load_paused_session(user_id: int) -> dict | None:
+    """Return the paused session dict if one exists and has not expired, else None."""
+    async with _acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT questions, current_idx, answers, session_dates "
+            "FROM paused_sessions "
+            "WHERE user_id = $1 AND expires_at > NOW()",
+            user_id,
+        )
+    if not row:
+        return None
+    return {
+        "questions":     json.loads(row["questions"]),
+        "current":       row["current_idx"],
+        "answers":       json.loads(row["answers"]),
+        "awaiting":      True,
+        "session_dates": json.loads(row["session_dates"]),
+    }
+
+
+async def _delete_paused_session(user_id: int) -> None:
+    """Remove the paused session row after the quiz is completed or abandoned."""
+    async with _acquire() as conn:
+        await conn.execute("DELETE FROM paused_sessions WHERE user_id = $1", user_id)
+
 
 # ─── Stats helpers ─────────────────────────────────────────────────────────────
 
@@ -889,6 +961,23 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def start_quiz(message, user_id):
+    # Restore a paused session if one exists (survives bot restarts and device switches).
+    paused = await _load_paused_session(user_id)
+    if paused:
+        user_sessions[user_id] = paused
+        answered = paused["current"]
+        total = len(paused["questions"])
+        await message.reply_text(
+            f"⏸ Продолжаю незавершённый квиз ({answered} из {total} вопросов пройдено).",
+        )
+        await send_question(message, user_id)
+        return
+
+    await _start_new_quiz(message, user_id)
+
+
+async def _start_new_quiz(message, user_id):
+    """Generate fresh questions and start a new quiz, discarding any paused state."""
     msg = await message.reply_text("⏳ Готовлю квиз... Это займёт около минуты.")
     try:
         stats, session_dates = await _load_compact_data(user_id)
@@ -908,13 +997,15 @@ async def start_quiz(message, user_id):
         if questions is None:
             raise last_exc
 
-        user_sessions[user_id] = {
+        session = {
             "questions": questions,
             "current": 0,
             "answers": [],
             "awaiting": True,
             "session_dates": session_dates,
         }
+        user_sessions[user_id] = session
+        await _save_paused_session(user_id, session)
         await msg.delete()
         await send_question(message, user_id)
     except Exception as e:
@@ -1164,11 +1255,16 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if user_id not in user_sessions:
-        try:
-            await query.answer("Сессия истекла. Напиши /quiz чтобы начать заново.")
-        except Exception:
-            pass
-        return
+        # Try to restore a paused session from the DB (e.g. after bot restart or from another device).
+        paused = await _load_paused_session(user_id)
+        if paused:
+            user_sessions[user_id] = paused
+        else:
+            try:
+                await query.answer("Сессия истекла. Напиши /quiz чтобы начать заново.")
+            except Exception:
+                pass
+            return
 
     session = user_sessions[user_id]
     if not session.get("awaiting"):
@@ -1237,6 +1333,11 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await finish_quiz(query.message, user_id)
     else:
         session["awaiting"] = True
+        # Persist progress after each answer so the quiz can be resumed from any device.
+        try:
+            await _save_paused_session(user_id, session)
+        except Exception as e:
+            print(f"[paused_session] save error: {e}")
         await send_question(query.message, user_id)
 
 async def finish_quiz(message, user_id):
@@ -1298,9 +1399,17 @@ async def finish_quiz(message, user_id):
             parse_mode="HTML",
         )
         del user_sessions[user_id]
+        try:
+            await _delete_paused_session(user_id)
+        except Exception:
+            pass
         return
 
     del user_sessions[user_id]
+    try:
+        await _delete_paused_session(user_id)
+    except Exception:
+        pass
     await message.reply_text(text, parse_mode="HTML")
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
