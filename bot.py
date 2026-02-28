@@ -848,9 +848,11 @@ def _parse_questions(raw: str, provider_name: str) -> list:
             raise ValueError(f"Question {i}: correctIndex={q.get('correctIndex')} out of range")
 
     # Validate all options are unique within each question — guards against AI returning duplicate choices
+    # (including "near-duplicates" with different casing or extra spaces)
     for i, q in enumerate(questions):
         opts = q["options"]
-        if len(opts) != len(set(opts)):
+        canonical_opts = [" ".join(o.split()).casefold() for o in opts]
+        if len(canonical_opts) != len(set(canonical_opts)):
             raise ValueError(f"Question {i}: duplicate options detected: {opts}")
 
     # Normalise topic names — guard against mixed Greek/Cyrillic characters
@@ -868,74 +870,94 @@ def _parse_questions(raw: str, provider_name: str) -> list:
 
 async def _generate_questions_openai(stats, session_dates, profile):
     import time
-    t0 = time.monotonic()
-    print(f"[openai] creating async client …", flush=True)
     client = AsyncOpenAI(api_key=OPENAI_KEY, timeout=55.0)
     system_prompt = build_system_prompt(profile or {})
     dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
-    print(f"[openai] sending request to gpt-4.1-mini (single attempt, prompt ~{len(dynamic_prompt)} chars) …", flush=True)
-    response = await client.chat.completions.create(
-        model="gpt-4.1-mini",
-        max_tokens=4500,
-        temperature=0.2,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "quiz_questions",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["questions"],
-                    "properties": {
-                        "questions": {
-                            "type": "array",
-                            "minItems": 20,
-                            "maxItems": 20,
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "required": ["question", "options", "correctIndex", "explanation", "topic", "type"],
-                                "properties": {
-                                    "question": {"type": "string"},
-                                    "options": {
-                                        "type": "array",
-                                        "minItems": 4,
-                                        "maxItems": 4,
-                                        "items": {"type": "string"},
+    max_attempts = 3
+    retry_hint = ""
+    last_error = None
+
+    print(f"[openai] creating async client …", flush=True)
+    for attempt in range(1, max_attempts + 1):
+        t0 = time.monotonic()
+        user_prompt = f"{dynamic_prompt}{retry_hint}"
+        print(
+            f"[openai] sending request to gpt-4.1-mini (attempt {attempt}/{max_attempts}, prompt ~{len(user_prompt)} chars) …",
+            flush=True,
+        )
+        response = await client.chat.completions.create(
+            model="gpt-4.1-mini",
+            max_tokens=4500,
+            temperature=0.2,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "quiz_questions",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["questions"],
+                        "properties": {
+                            "questions": {
+                                "type": "array",
+                                "minItems": 20,
+                                "maxItems": 20,
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "required": ["question", "options", "correctIndex", "explanation", "topic", "type"],
+                                    "properties": {
+                                        "question": {"type": "string"},
+                                        "options": {
+                                            "type": "array",
+                                            "minItems": 4,
+                                            "maxItems": 4,
+                                            "items": {"type": "string"},
+                                        },
+                                        "correctIndex": {"type": "integer", "minimum": 0, "maximum": 3},
+                                        "explanation": {"type": "string"},
+                                        "topic": {"type": "string", "enum": MASTER_TOPICS},
+                                        "type": {"type": "string", "enum": list(TYPE_LABELS.keys())},
                                     },
-                                    "correctIndex": {"type": "integer", "minimum": 0, "maximum": 3},
-                                    "explanation": {"type": "string"},
-                                    "topic": {"type": "string", "enum": MASTER_TOPICS},
-                                    "type": {"type": "string", "enum": list(TYPE_LABELS.keys())},
                                 },
                             },
                         },
                     },
                 },
             },
-        },
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": dynamic_prompt},
-        ],
-    )
-    elapsed = time.monotonic() - t0
-    print(f"[openai] response received in {elapsed:.1f}s", flush=True)
-    choice = response.choices[0]
-    finish = choice.finish_reason
-    raw = (choice.message.content or "").strip()
-    print(f"[openai] finish_reason={finish!r}, content length={len(raw)} chars", flush=True)
-    if finish == "length":
-        raise ValueError(
-            "gpt-4.1-mini обрезал ответ по лимиту токенов (finish_reason='length'). "
-            "Повтори квиз: запрос выполняется только одной попыткой без автоповторов."
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
         )
-    if not raw:
-        raise ValueError(f"gpt-4.1-mini вернул пустой ответ (finish_reason={finish!r})")
-    parsed = _parse_questions(raw, "gpt-4.1-mini")
-    print(f"[openai] parsed response ok ({len(raw)} chars)", flush=True)
-    return parsed
+        elapsed = time.monotonic() - t0
+        print(f"[openai] response received in {elapsed:.1f}s", flush=True)
+        choice = response.choices[0]
+        finish = choice.finish_reason
+        raw = (choice.message.content or "").strip()
+        print(f"[openai] finish_reason={finish!r}, content length={len(raw)} chars", flush=True)
+        if finish == "length":
+            raise ValueError("gpt-4.1-mini обрезал ответ по лимиту токенов (finish_reason='length').")
+        if not raw:
+            last_error = ValueError(f"gpt-4.1-mini вернул пустой ответ (finish_reason={finish!r})")
+        else:
+            try:
+                parsed = _parse_questions(raw, "gpt-4.1-mini")
+                print(f"[openai] parsed response ok ({len(raw)} chars)", flush=True)
+                return parsed
+            except ValueError as e:
+                last_error = e
+
+        if attempt < max_attempts:
+            print(f"[openai] validation failed, retrying: {last_error}", flush=True)
+            retry_hint = (
+                "\n\nВАЖНО: Исправь предыдущую ошибку валидации и сгенерируй новый JSON с нуля. "
+                "Во всех вопросах должны быть ровно 4 уникальных варианта ответа (без дубликатов даже по регистру/пробелам). "
+                f"Ошибка предыдущей попытки: {last_error}"
+            )
+
+    raise ValueError(f"Не удалось сгенерировать валидный квиз за {max_attempts} попытки. Последняя ошибка: {last_error}")
 
 
 async def generate_questions(stats, session_dates, profile):
