@@ -765,7 +765,7 @@ async def send_about_message(message):
         "/stats - статистика\n"
         "/settings - настройки профиля\n"
         "/about - о Greekly\n"
-        "/admin - админка\n\n"
+        "\n"
         "⚠️ Вопросы генерирует AI - возможны неточности.\n\n"
         "Автор: @aparasochka",
         parse_mode="HTML",
@@ -1907,7 +1907,6 @@ async def post_init(app):
         BotCommand("stats",    "Моя статистика"),
         BotCommand("settings", "Настройки профиля"),
         BotCommand("about",    "О Greekly"),
-        BotCommand("admin",    "Админка"),
     ])
 
 def main():
