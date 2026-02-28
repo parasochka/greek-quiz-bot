@@ -846,7 +846,7 @@ def _generate_questions_claude(stats, session_dates, profile):
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=6000,
-        temperature=0.5,
+        temperature=0.3,
         system=system_prompt,
         messages=[{"role": "user", "content": dynamic_prompt}],
     )
@@ -866,7 +866,7 @@ async def _generate_questions_openai(stats, session_dates, profile):
     response = await client.chat.completions.create(
         model="gpt-4.1-mini",
         max_tokens=6000,
-        temperature=0.5,
+        temperature=0.3,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": dynamic_prompt},
