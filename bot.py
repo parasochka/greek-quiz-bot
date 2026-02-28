@@ -1558,6 +1558,18 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
 
+    async def _clear_reply_markup() -> None:
+        """Safely remove inline keyboard from callback message.
+
+        Telegram may deliver duplicate callbacks for the same button press.
+        In races, the second edit gets "Message is not modified" — ignore it.
+        """
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                raise
+
     # ── Menu ──
     if data.startswith("menu_"):
         await handle_menu(update, context)
@@ -1729,7 +1741,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
         except Exception:
             pass
-        await query.edit_message_reply_markup(reply_markup=None)
+        await _clear_reply_markup()
         await _reset_profile(user_id)
         context.user_data.clear()
         await query.message.reply_text(
@@ -1776,7 +1788,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
         except Exception:
             pass
-        await query.edit_message_reply_markup(reply_markup=None)
+        await _clear_reply_markup()
         try:
             count = await clear_history(user_id)
             await query.message.reply_text(
@@ -1798,7 +1810,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
         except Exception:
             pass
-        await query.edit_message_reply_markup(reply_markup=None)
+        await _clear_reply_markup()
         await query.message.reply_text("✅ Отмена. История не тронута.")
         return
 
@@ -1808,7 +1820,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
         except Exception:
             pass
-        await query.edit_message_reply_markup(reply_markup=None)
+        await _clear_reply_markup()
         paused = await _load_paused_session(user_id)
         if paused:
             user_sessions[user_id] = paused
@@ -1828,7 +1840,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
         except Exception:
             pass
-        await query.edit_message_reply_markup(reply_markup=None)
+        await _clear_reply_markup()
         await _delete_paused_session(user_id)
         if user_id in user_sessions:
             del user_sessions[user_id]
@@ -1914,13 +1926,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💡 {h(q['explanation'])}"
         )
 
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except BadRequest as e:
-        # Duplicate callback deliveries can race and try to remove an already-removed keyboard.
-        # Telegram returns "Message is not modified" in this case; ignore and continue.
-        if "Message is not modified" not in str(e):
-            raise
+    await _clear_reply_markup()
     await query.message.reply_text(result, parse_mode="HTML")
 
     session["current"] += 1
