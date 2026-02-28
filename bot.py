@@ -867,54 +867,62 @@ async def _generate_questions_openai(stats, session_dates, profile):
     client = AsyncOpenAI(api_key=OPENAI_KEY, timeout=55.0)
     system_prompt = build_system_prompt(profile or {})
     dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
-    repair_note = ""
-    for attempt in range(1, 4):
-        prompt = dynamic_prompt + repair_note
-        print(f"[openai] sending request to gpt-4.1-mini (attempt {attempt}, prompt ~{len(prompt)} chars) …", flush=True)
-        response = await client.chat.completions.create(
-            model="gpt-4.1-mini",
-            max_tokens=6000,
-            temperature=0.3,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
+    print(f"[openai] sending request to gpt-4.1-mini (single attempt, prompt ~{len(dynamic_prompt)} chars) …", flush=True)
+    response = await client.chat.completions.create(
+        model="gpt-4.1-mini",
+        max_tokens=4500,
+        temperature=0.2,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "quiz_questions",
+                "strict": True,
+                "schema": {
+                    "type": "array",
+                    "minItems": 20,
+                    "maxItems": 20,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["question", "options", "correctIndex", "explanation", "topic", "type"],
+                        "properties": {
+                            "question": {"type": "string"},
+                            "options": {
+                                "type": "array",
+                                "minItems": 4,
+                                "maxItems": 4,
+                                "items": {"type": "string"},
+                            },
+                            "correctIndex": {"type": "integer", "minimum": 0, "maximum": 3},
+                            "explanation": {"type": "string"},
+                            "topic": {"type": "string", "enum": MASTER_TOPICS},
+                            "type": {"type": "string", "enum": list(TYPE_LABELS.keys())},
+                        },
+                    },
+                },
+            },
+        },
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": dynamic_prompt},
+        ],
+    )
+    elapsed = time.monotonic() - t0
+    print(f"[openai] response received in {elapsed:.1f}s", flush=True)
+    choice = response.choices[0]
+    finish = choice.finish_reason
+    raw = (choice.message.content or "").strip()
+    print(f"[openai] finish_reason={finish!r}, content length={len(raw)} chars", flush=True)
+    if finish == "length":
+        raise ValueError(
+            "gpt-4.1-mini обрезал ответ по лимиту токенов (finish_reason='length'). "
+            "Повтори квиз: запрос выполняется только одной попыткой без автоповторов."
         )
-        elapsed = time.monotonic() - t0
-        print(f"[openai] response received in {elapsed:.1f}s", flush=True)
-        choice = response.choices[0]
-        finish = choice.finish_reason
-        raw = (choice.message.content or "").strip()
-        print(f"[openai] finish_reason={finish!r}, content length={len(raw)} chars", flush=True)
-        if finish == "length":
-            if attempt == 3:
-                raise ValueError(
-                    f"gpt-4.1-mini обрезал ответ по лимиту токенов (finish_reason='length'). "
-                    f"Первые 300 символов: {raw[:300]}"
-                )
-            repair_note = (
-                "\n\nПРЕДЫДУЩИЙ ОТВЕТ БЫЛ ОБРЕЗАН ПО ЛИМИТУ ТОКЕНОВ. "
-                "Сгенерируй заново строго компактный JSON-массив из 20 объектов и ничего больше."
-            )
-            continue
-        if not raw:
-            if attempt == 3:
-                raise ValueError(f"gpt-4.1-mini вернул пустой ответ (finish_reason={finish!r})")
-            repair_note = "\n\nПРЕДЫДУЩИЙ ОТВЕТ ПУСТОЙ. Верни корректный JSON-массив из 20 объектов."
-            continue
-        try:
-            parsed = _parse_questions(raw, "gpt-4.1-mini")
-            print(f"[openai] parsed response ok ({len(raw)} chars)", flush=True)
-            return parsed
-        except ValueError as e:
-            if attempt == 3:
-                raise
-            repair_note = (
-                "\n\nПРЕДЫДУЩИЙ ОТВЕТ НЕ ПРОШЁЛ ВАЛИДАЦИЮ. "
-                f"Ошибка: {e}. Сгенерируй заново С НУЛЯ и верни только корректный JSON-массив."
-            )
-
-    raise ValueError("gpt-4.1-mini: не удалось сгенерировать валидный квиз после 3 попыток")
+    if not raw:
+        raise ValueError(f"gpt-4.1-mini вернул пустой ответ (finish_reason={finish!r})")
+    parsed = _parse_questions(raw, "gpt-4.1-mini")
+    print(f"[openai] parsed response ok ({len(raw)} chars)", flush=True)
+    return parsed
 
 
 async def generate_questions(stats, session_dates, profile):
