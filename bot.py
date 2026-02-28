@@ -1,10 +1,12 @@
 import os
 import signal
+import time
 import json
 import html
 import random
 import asyncio
 import contextlib
+import traceback
 import unicodedata
 import asyncpg
 from datetime import datetime, date, timedelta, timezone
@@ -804,7 +806,7 @@ def build_dynamic_prompt(stats, session_dates, profile, required_topics=None):
     pre_exam_note = ""
     if exam_date_obj:
         if isinstance(exam_date_obj, date):
-            days_left = max((datetime.combine(exam_date_obj, datetime.min.time()) - datetime.now()).days, 0)
+            days_left = max((exam_date_obj - date.today()).days, 0)
         else:
             days_left = 0
         if days_left > 0:
@@ -869,6 +871,21 @@ def _extract_questions(raw: str, provider_name: str, expected_count: int = 20) -
     return questions
 
 
+TYPE_LABELS = {
+    "ru_to_gr":    "🇷🇺 → 🇬🇷 Перевод",
+    "gr_to_ru":    "🇬🇷 → 🇷🇺 Перевод",
+    "choose_form": "📝 Выбор формы",
+    "fill_blank":  "✏️ Заполни пропуск",
+}
+
+TYPE_NAMES_RU = {
+    "ru_to_gr":    "Перевод RU→GR",
+    "gr_to_ru":    "Перевод GR→RU",
+    "choose_form": "Выбор формы",
+    "fill_blank":  "Заполни пропуск",
+}
+
+
 def _collect_question_errors(questions: list) -> dict:
     """Return {index: reason} for per-question schema/content errors."""
     errors = {}
@@ -897,6 +914,9 @@ def _collect_question_errors(questions: list) -> dict:
             continue
         if q["type"] not in TYPE_LABELS:
             errors[i] = f"недопустимый type={q['type']!r}"
+            continue
+        if q.get("topic") not in MASTER_TOPICS:
+            errors[i] = f"недопустимый topic={q.get('topic')!r}"
             continue
         opts = q.get("options")
         if not isinstance(opts, list) or len(opts) != 4:
@@ -1027,7 +1047,6 @@ async def _repair_questions_openai(client, system_prompt: str, questions: list, 
 
 
 async def _generate_questions_openai(stats, session_dates, profile, required_topics=None):
-    import time
     client = AsyncOpenAI(api_key=OPENAI_KEY, timeout=OPENAI_REQUEST_TIMEOUT_SEC)
     system_prompt = build_system_prompt(profile or {})
     dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {}, required_topics=required_topics)
@@ -1165,20 +1184,6 @@ def _get_user_answer_lock(user_id: int) -> asyncio.Lock:
     return lock
 
 # ─── Handlers ──────────────────────────────────────────────────────────────────
-
-TYPE_LABELS = {
-    "ru_to_gr":    "🇷🇺 → 🇬🇷 Перевод",
-    "gr_to_ru":    "🇬🇷 → 🇷🇺 Перевод",
-    "choose_form": "📝 Выбор формы",
-    "fill_blank":  "✏️ Заполни пропуск",
-}
-
-TYPE_NAMES_RU = {
-    "ru_to_gr":    "Перевод RU→GR",
-    "gr_to_ru":    "Перевод GR→RU",
-    "choose_form": "Выбор формы",
-    "fill_blank":  "Заполни пропуск",
-}
 
 async def _send_onboarding_step(message, step_index, context):
     """Send the next onboarding question to the user."""
@@ -1322,8 +1327,6 @@ async def start_quiz(message, user_id):
 
 async def _start_new_quiz(message, user_id):
     """Generate fresh questions and start a new quiz, discarding any paused state."""
-    import time
-    import traceback
     msg = await message.reply_text("⏳ Готовлю квиз... Это займёт около минуты.")
     try:
         t_start = time.monotonic()
@@ -1391,6 +1394,15 @@ async def send_question(message, user_id):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML",
     )
+
+PROFILE_FIELD_LABELS = {
+    "display_name": "Имя",       "age":        "Возраст",
+    "city":         "Город проживания", "native_lang": "Родной язык",
+    "other_langs":  "Другие языки", "occupation": "Работа/занятие",
+    "family":       "Семья",     "hobbies":     "Хобби",
+    "greek_goal":   "Место применения", "exam_date": "Дата экзамена",
+}
+
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1927,7 +1939,7 @@ async def show_stats(message, user_id: int):
     exam_date_obj = profile.get("exam_date")
     exam_line = ""
     if exam_date_obj and isinstance(exam_date_obj, date):
-        days_left = max((datetime.combine(exam_date_obj, datetime.min.time()) - datetime.now()).days, 0)
+        days_left = max((exam_date_obj - date.today()).days, 0)
         if days_left > 0:
             exam_line = f"📅 До экзамена: <b>{days_left} дней</b>\n"
 
@@ -2039,14 +2051,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ─── Settings ─────────────────────────────────────────────────────────────────
-
-PROFILE_FIELD_LABELS = {
-    "display_name": "Имя",       "age":        "Возраст",
-    "city":         "Город проживания", "native_lang": "Родной язык",
-    "other_langs":  "Другие языки", "occupation": "Работа/занятие",
-    "family":       "Семья",     "hobbies":     "Хобби",
-    "greek_goal":   "Место применения", "exam_date": "Дата экзамена",
-}
 
 
 def _format_profile(profile: dict) -> str:
