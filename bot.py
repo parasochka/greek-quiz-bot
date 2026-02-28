@@ -568,6 +568,7 @@ PROMPT_STATIC = """КРИТИЧЕСКИ ВАЖНО:
   Хорошо: «Ты договариваешься с коллегой о корпоративе. Как сказать: "Вечеринка будет 31 декабря"?»
   Плохо: «Вставь артикль: ___ γυναίκα είναι όμορφη.»
   Хорошо: «Ты рассказываешь соседу о жене. Вставь нужный артикль: "___ γυναίκα μου είναι πολύ ωραία."»
+- Разнообразь собеседников и места действия: сосед, коллега, врач, продавец, турист, незнакомец на улице, официант, кассир, ребёнок. Места: кафе, рынок, автобус, поликлиника, магазин, пляж, аптека, офис, лифт. Чередуй эмоциональные контексты: просьба, удивление, проблема, срочность, радость, неловкость. Не повторяй один и тот же сценарий дважды в одном квизе.
 
 Приоритеты при подборе тем для ЭТОГО квиза:
 - 🔴 Темы ниже 60% → 35% вопросов (слабые места, приоритет)
@@ -662,7 +663,15 @@ PROMPT_STATIC = """КРИТИЧЕСКИ ВАЖНО:
 
 Варианты ответа должны быть перемешаны случайным образом — correctIndex указывает реальную позицию правильного варианта.
 Неправильные варианты — правдоподобные: похожие формы, близкие слова, частые ошибки.
-ОБЯЗАТЕЛЬНО: все 4 варианта в каждом вопросе должны быть разными строками — никаких повторений внутри одного вопроса."""
+ОБЯЗАТЕЛЬНО: все 4 варианта в каждом вопросе должны быть разными строками — никаких повторений внутри одного вопроса.
+
+СТРУКТУРА JSON НЕИЗМЕННА — независимо от содержания вопросов:
+• Ровно 20 объектов в массиве — не меньше, не больше.
+• Каждый объект содержит ровно 6 полей: question, options, correctIndex, explanation, topic, type.
+• options — массив ровно из 4 строк.
+• correctIndex — целое число: 0, 1, 2 или 3.
+• Никакого текста вне JSON-массива, никаких ```json``` обёрток, никаких комментариев.
+Вся творческая свобода — в тексте: живые и неожиданные ситуации, яркие сценарии, богатые объяснения."""
 
 
 def build_profile_section(profile: dict) -> str:
@@ -836,7 +845,8 @@ def _generate_questions_claude(stats, session_dates, profile):
     dynamic_prompt = build_dynamic_prompt(stats, session_dates, profile or {})
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=4000,
+        max_tokens=6000,
+        temperature=0.5,
         system=system_prompt,
         messages=[{"role": "user", "content": dynamic_prompt}],
     )
@@ -855,8 +865,8 @@ async def _generate_questions_openai(stats, session_dates, profile):
     print(f"[openai] sending request to gpt-4.1-mini (prompt ~{len(dynamic_prompt)} chars) …", flush=True)
     response = await client.chat.completions.create(
         model="gpt-4.1-mini",
-        max_tokens=4000,
-        temperature=0.2,
+        max_tokens=6000,
+        temperature=0.5,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": dynamic_prompt},
@@ -979,7 +989,7 @@ async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
-    await start_quiz(update.message, update.effective_user.id)
+    await start_quiz(update.message, update.effective_user.id, username=update.effective_user.username)
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -997,7 +1007,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         await query.message.reply_text("⏳ Запускаю квиз...")
-        await start_quiz(query.message, query.from_user.id)
+        await start_quiz(query.message, query.from_user.id, username=query.from_user.username)
 
     elif query.data == "menu_stats":
         await show_stats(query.message, query.from_user.id)
@@ -1025,13 +1035,25 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
 
-async def start_quiz(message, user_id):
+async def start_quiz(message, user_id, username=None):
     # Restore a paused session if one exists (survives bot restarts and device switches).
     paused = await _load_paused_session(user_id)
     if paused:
-        user_sessions[user_id] = paused
         answered = paused["current"]
         total = len(paused["questions"])
+        # Owner gets a choice: resume paused session or start fresh (for testing).
+        if username == OWNER_USERNAME:
+            keyboard = [[
+                InlineKeyboardButton("▶️ Продолжить", callback_data="quiz_resume"),
+                InlineKeyboardButton("🔄 Начать заново", callback_data="quiz_restart"),
+            ]]
+            await message.reply_text(
+                f"⏸ Есть незавершённый квиз ({answered} из {total} вопросов пройдено).\n\n"
+                f"Продолжить или начать новый?",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
+        user_sessions[user_id] = paused
         await message.reply_text(
             f"⏸ Продолжаю незавершённый квиз ({answered} из {total} вопросов пройдено).",
         )
@@ -1318,6 +1340,39 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("✅ Отмена. История не тронута.")
+        return
+
+    # ── Owner-only: resume paused quiz ──
+    if data == "quiz_resume":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_reply_markup(reply_markup=None)
+        paused = await _load_paused_session(user_id)
+        if paused:
+            user_sessions[user_id] = paused
+            answered = paused["current"]
+            total = len(paused["questions"])
+            await query.message.reply_text(
+                f"⏸ Продолжаю незавершённый квиз ({answered} из {total} вопросов пройдено).",
+            )
+            await send_question(query.message, user_id)
+        else:
+            await _start_new_quiz(query.message, user_id)
+        return
+
+    # ── Owner-only: discard paused quiz and start fresh ──
+    if data == "quiz_restart":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_reply_markup(reply_markup=None)
+        await _delete_paused_session(user_id)
+        if user_id in user_sessions:
+            del user_sessions[user_id]
+        await _start_new_quiz(query.message, user_id)
         return
 
     # ── Quiz answer ──
